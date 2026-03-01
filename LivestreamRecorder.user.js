@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.2.0
+// @version      1.3.0
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -208,9 +208,12 @@
      * @param {FileSystemFileHandle} fileHandle
      * @param {function(number): void} onProgress - called with bytes written per chunk
      * @param {{ stopped: boolean }} stopSignal
+     * @param {{ keepExisting?: boolean, seekOffset?: number }} [opts] - resume options
      */
-    async function downloadHLS(url, fileHandle, onProgress, stopSignal) {
-        const writable = await fileHandle.createWritable();
+    async function downloadHLS(url, fileHandle, onProgress, stopSignal, opts = {}) {
+        const { keepExisting = false, seekOffset = 0 } = opts;
+        const writable = await fileHandle.createWritable({ keepExistingData: keepExisting });
+        if (seekOffset > 0) await writable.seek(seekOffset);
         // Track downloaded segment sequence numbers to avoid duplicates on live playlists.
         let lastDownloadedSequence = -1;
         let targetDuration = 5;
@@ -279,9 +282,12 @@
      * @param {FileSystemFileHandle} fileHandle
      * @param {function(number): void} onProgress
      * @param {{ stopped: boolean }} stopSignal
+     * @param {{ startOffset?: number }} [opts] - resume options
      */
-    async function downloadDirect(url, fileHandle, onProgress, stopSignal) {
-        const writable = await fileHandle.createWritable();
+    async function downloadDirect(url, fileHandle, onProgress, stopSignal, opts = {}) {
+        const { startOffset = 0 } = opts;
+        const writable = await fileHandle.createWritable({ keepExistingData: startOffset > 0 });
+        if (startOffset > 0) await writable.seek(startOffset);
         const CHUNK = 4 * 1024 * 1024; // 4 MB per Range request
 
         try {
@@ -300,7 +306,8 @@
 
             if (supportsRange && totalSize !== null) {
                 // Chunked Range download — nothing large sits in memory at once.
-                let offset = 0;
+                // On resume, startOffset lets us skip already-downloaded bytes.
+                let offset = startOffset;
                 while (offset < totalSize && !stopSignal.stopped) {
                     const end = Math.min(offset + CHUNK - 1, totalSize - 1);
                     const r = await gmFetch(url, { responseType: 'arraybuffer', rangeStart: offset, rangeEnd: end });
@@ -324,6 +331,11 @@
     }
 
     // ─── Start / stop downloads ───────────────────────────────────────────────────
+
+    /** Creates the standard progress callback used by both startDownload and resumeDownload. */
+    function _makeProgressCallback(dl) {
+        return (bytes) => { dl.bytesWritten += bytes; updateUI(); _debouncedPersistDownloads(); };
+    }
 
     async function startDownload(url) {
         if (!downloadDirHandle) {
@@ -355,6 +367,7 @@
             id,
             url,
             filename,
+            isHLS,
             status: 'downloading',
             bytesWritten: 0,
             stopSignal,
@@ -372,7 +385,7 @@
 
         try {
             const fileHandle = await downloadDirHandle.getFileHandle(filename, { create: true });
-            const onProgress = (bytes) => { dl.bytesWritten += bytes; updateUI(); _debouncedPersistDownloads(); };
+            const onProgress = _makeProgressCallback(dl);
 
             if (isHLS) {
                 await downloadHLS(url, fileHandle, onProgress, stopSignal);
@@ -588,6 +601,7 @@
             id:           dl.id,
             url:          dl.url,
             filename:     dl.filename,
+            isHLS:        dl.isHLS,
             status:       dl.status,
             bytesWritten: dl.bytesWritten,
         }));
@@ -600,7 +614,8 @@
 
     /**
      * Restore persisted state on load.
-     * Downloads that were `downloading` when the tab closed are shown as `interrupted`.
+     * Downloads that were `downloading` are marked for automatic resumption;
+     * all other terminal statuses are shown as-is.
      */
     async function _restoreState() {
         const [streams, mimeEntries, m3u8Prefixes, downloads, savedNextId] = await Promise.all([
@@ -617,26 +632,109 @@
 
         if (Array.isArray(downloads)) {
             downloads.forEach((saved) => {
-                // Downloads that were in-flight when the tab closed are now interrupted.
-                const status = saved.status === 'downloading' ? 'interrupted' : saved.status;
-                activeDownloads.set(saved.id, {
-                    id:           saved.id,
-                    url:          saved.url,
-                    filename:     saved.filename,
-                    status,
-                    bytesWritten: saved.bytesWritten,
-                    stopSignal:   { stopped: true },
-                    // stop() is a no-op on restored entries — the download is already
-                    // interrupted and cannot be resumed; the stub satisfies the interface
-                    // expected by updateUI().
-                    stop()        {},
-                });
+                if (saved.status !== 'downloading') {
+                    // Terminal entries (completed, stopped, error, interrupted) — display as-is.
+                    activeDownloads.set(saved.id, {
+                        id:           saved.id,
+                        url:          saved.url,
+                        filename:     saved.filename,
+                        isHLS:        saved.isHLS,
+                        status:       saved.status,
+                        bytesWritten: saved.bytesWritten,
+                        stopSignal:   { stopped: true },
+                        // stop() is a no-op on terminal entries; stub satisfies the updateUI interface.
+                        stop()        {},
+                    });
+                } else {
+                    // In-flight downloads will be auto-resumed after the directory handle is loaded.
+                    const stopSignal = { stopped: false };
+                    const dl = {
+                        id:           saved.id,
+                        url:          saved.url,
+                        filename:     saved.filename,
+                        isHLS:        saved.isHLS,
+                        status:       'downloading',
+                        bytesWritten: saved.bytesWritten,
+                        stopSignal,
+                        _isRestored:  true,
+                        stop() {
+                            stopSignal.stopped = true;
+                            dl.status = 'stopped';
+                            updateUI();
+                            _persistDownloads();
+                        },
+                    };
+                    activeDownloads.set(saved.id, dl);
+                }
             });
         }
 
         if (typeof savedNextId === 'number' && savedNextId > nextId) nextId = savedNextId;
 
         updateUI();
+    }
+
+    /**
+     * Resume a single previously-active download after a page reload.
+     * Reads the actual on-disk file size as the byte-accurate resume point so
+     * any debounce lag in the last persisted `bytesWritten` value is corrected.
+     * @param {object} dl - download record with `_isRestored` already deleted
+     */
+    async function resumeDownload(dl) {
+        if (!downloadDirHandle) {
+            dl.status = 'interrupted';
+            updateUI();
+            _persistDownloads();
+            return;
+        }
+        try {
+            const fileHandle = await downloadDirHandle.getFileHandle(dl.filename, { create: true });
+            // Use the real on-disk file size — more reliable than the persisted bytesWritten.
+            // If the file was deleted between sessions, size will be 0 and the download restarts
+            // from scratch (safe for live streams; VOD will re-fetch from the beginning).
+            const existingFile = await fileHandle.getFile();
+            const startOffset  = existingFile.size;
+            if (startOffset === 0 && dl.bytesWritten > 0) {
+                console.warn('[LivestreamRecorder] Partial file lost; restarting download:', dl.filename);
+            }
+            dl.bytesWritten = startOffset;
+            updateUI();
+
+            const onProgress = _makeProgressCallback(dl);
+
+            if (dl.isHLS) {
+                await downloadHLS(dl.url, fileHandle, onProgress, dl.stopSignal,
+                    { keepExisting: true, seekOffset: startOffset });
+            } else {
+                await downloadDirect(dl.url, fileHandle, onProgress, dl.stopSignal,
+                    { startOffset });
+            }
+
+            if (!dl.stopSignal.stopped) dl.status = 'completed';
+        } catch (e) {
+            console.error('[LivestreamRecorder] Resume error:', e);
+            dl.status = 'interrupted';
+        }
+        updateUI();
+        _persistDownloads();
+    }
+
+    /**
+     * After the directory handle has been applied, resume all downloads that were
+     * active when the page was last unloaded.
+     * Resumes concurrently (consistent with how startDownload works for multiple streams).
+     * If no directory handle is available (permission lapsed), each resume call marks
+     * its download as interrupted.
+     */
+    function _resumeRestoredDownloads() {
+        const pending = [];
+        for (const dl of activeDownloads.values()) {
+            if (dl._isRestored) {
+                delete dl._isRestored;
+                pending.push(resumeDownload(dl));
+            }
+        }
+        return Promise.all(pending);
     }
 
     // ─── UI ───────────────────────────────────────────────────────────────────────
@@ -938,9 +1036,12 @@
             }
         };
 
-        // Restore all persisted state (streams, downloads, directory handle) from IDB.
-        _restoreState();
-        _loadHandleFromIDB().then(_applyDirectoryHandle);
+        // Restore all persisted state (streams, downloads, directory handle) from IDB,
+        // then resume any downloads that were active when the tab was last unloaded.
+        Promise.all([_restoreState(), _loadHandleFromIDB()]).then(async ([, handle]) => {
+            await _applyDirectoryHandle(handle);
+            _resumeRestoredDownloads();
+        });
     }
 
     if (document.readyState === 'loading') {
