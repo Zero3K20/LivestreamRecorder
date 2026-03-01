@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.3.1
+// @version      1.3.2
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -523,13 +523,34 @@
      */
     const DIR_CHANNEL = new BroadcastChannel('lsr-dir-channel');
 
+    // Shared promise for the one IDB connection used by this page.
+    // All callers await the same Promise so their microtask continuations are
+    // queued in FIFO order, which guarantees that IDB transactions are created
+    // (and therefore committed) in exactly the order _idbPut/_idbGet were called.
+    // Without this, each call opened a fresh indexedDB.open() request; if the
+    // first request (e.g. from setInterval) resolved slower than a later one
+    // (e.g. from clearDownloads), the later transaction would commit first,
+    // and the stale snapshot from the setInterval would overwrite the cleared state.
+    let _idbPromise = null;
+
     function _openIDB() {
-        return new Promise((resolve, reject) => {
-            const req = indexedDB.open('LivestreamRecorder', 1);
-            req.onupgradeneeded = () => req.result.createObjectStore('state');
-            req.onsuccess = () => resolve(req.result);
-            req.onerror = () => reject(req.error);
-        });
+        if (!_idbPromise) {
+            _idbPromise = new Promise((resolve, reject) => {
+                const req = indexedDB.open('LivestreamRecorder', 1);
+                req.onupgradeneeded = () => req.result.createObjectStore('state');
+                req.onsuccess = () => {
+                    const db = req.result;
+                    // If another tab opens a newer DB version, close gracefully and
+                    // reset so the next call can re-connect cleanly.
+                    db.onversionchange = () => { db.close(); _idbPromise = null; };
+                    // Reset if the connection is closed unexpectedly.
+                    db.onclose = () => { _idbPromise = null; };
+                    resolve(db);
+                };
+                req.onerror = () => { _idbPromise = null; reject(req.error); };
+            });
+        }
+        return _idbPromise;
     }
 
     /** Generic IDB put — stores `value` under `key` in the `state` object store. */
