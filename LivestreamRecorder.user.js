@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.3.8
+// @version      1.3.9
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -48,6 +48,28 @@
      * @type {Set<string>}
      */
     const detectedM3U8Prefixes = new Set();
+
+    /**
+     * Stable identifier for this tab session.  sessionStorage retains the value
+     * across same-tab page refreshes but never shares it with other tabs, so
+     * downloads started in this tab are only visible here.
+     */
+    const TAB_ID = (() => {
+        let id = sessionStorage.getItem('__LSR_tabId__');
+        if (!id) {
+            id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+                ? crypto.randomUUID()
+                : Date.now().toString(36) + Math.random().toString(36).slice(2);
+            sessionStorage.setItem('__LSR_tabId__', id);
+        }
+        return id;
+    })();
+
+    /** IDB and GM storage keys scoped to this tab so downloads don't leak across tabs. */
+    const DOWNLOADS_IDB_KEY = 'downloads_' + TAB_ID;
+    const NEXT_ID_IDB_KEY   = 'nextId_'    + TAB_ID;
+    const DOWNLOADS_GM_KEY  = '__LSR_downloads_' + TAB_ID + '__';
+    const NEXT_ID_GM_KEY    = '__LSR_nextId_'    + TAB_ID + '__';
 
     let nextId = 1;
 
@@ -657,11 +679,11 @@
         // all sandbox modes (unlike localStorage, which is isolated from the
         // page's storage when any @grant value is declared).
         try {
-            GM_setValue('__LSR_downloads__', JSON.stringify(snapshot));
-            GM_setValue('__LSR_nextId__',    String(nextId));
+            GM_setValue(DOWNLOADS_GM_KEY, JSON.stringify(snapshot));
+            GM_setValue(NEXT_ID_GM_KEY,   String(nextId));
         } catch (e) { console.warn('[LivestreamRecorder] GM_setValue backup failed:', e); }
-        await _idbPut('downloads', snapshot);
-        await _idbPut('nextId',    nextId);
+        await _idbPut(DOWNLOADS_IDB_KEY, snapshot);
+        await _idbPut(NEXT_ID_IDB_KEY,   nextId);
     }
 
     const _debouncedPersistStreams   = _debounce(_persistDetectedStreams, 500);
@@ -677,8 +699,8 @@
             _idbGet('detectedStreams'),
             _idbGet('streamMimeTypes'),
             _idbGet('detectedM3U8Prefixes'),
-            _idbGet('downloads'),
-            _idbGet('nextId'),
+            _idbGet(DOWNLOADS_IDB_KEY),
+            _idbGet(NEXT_ID_IDB_KEY),
         ]);
 
         // Fall back to the GM_setValue backup when IDB has no entry (null) OR
@@ -687,12 +709,12 @@
         // means clearDownloads() ran intentionally, so we leave the list empty.
         if (downloads === null || (Array.isArray(downloads) && downloads.length === 0)) {
             try {
-                const raw = GM_getValue('__LSR_downloads__', null);
+                const raw = GM_getValue(DOWNLOADS_GM_KEY, null);
                 if (raw) {
                     const parsed = JSON.parse(raw);
                     if (Array.isArray(parsed) && parsed.length > 0) {
                         downloads = parsed;
-                        const rawId = GM_getValue('__LSR_nextId__', null);
+                        const rawId = GM_getValue(NEXT_ID_GM_KEY, null);
                         if (rawId !== null && savedNextId === null) {
                             const parsedNextId = parseInt(rawId, 10);
                             if (!isNaN(parsedNextId)) savedNextId = parsedNextId;
