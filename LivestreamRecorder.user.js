@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.3.7
+// @version      1.3.8
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -681,19 +681,22 @@
             _idbGet('nextId'),
         ]);
 
-        // If IDB has no downloads entry (key was never written because the
-        // page was refreshed before the async IDB transaction committed),
-        // fall back to the GM_setValue backup written synchronously at the
-        // start of every _persistDownloads() call.
-        if (downloads === null) {
+        // Fall back to the GM_setValue backup when IDB has no entry (null) OR
+        // has an empty array — either means the download write didn't commit
+        // before the last page unload.  If the GM backup is also empty that
+        // means clearDownloads() ran intentionally, so we leave the list empty.
+        if (downloads === null || (Array.isArray(downloads) && downloads.length === 0)) {
             try {
                 const raw = GM_getValue('__LSR_downloads__', null);
                 if (raw) {
-                    downloads = JSON.parse(raw);
-                    const rawId = GM_getValue('__LSR_nextId__', null);
-                    if (rawId !== null && savedNextId === null) {
-                        const parsed = parseInt(rawId, 10);
-                        if (!isNaN(parsed)) savedNextId = parsed;
+                    const parsed = JSON.parse(raw);
+                    if (Array.isArray(parsed) && parsed.length > 0) {
+                        downloads = parsed;
+                        const rawId = GM_getValue('__LSR_nextId__', null);
+                        if (rawId !== null && savedNextId === null) {
+                            const parsedNextId = parseInt(rawId, 10);
+                            if (!isNaN(parsedNextId)) savedNextId = parsedNextId;
+                        }
                     }
                 }
             } catch (e) { /* corrupt data */ }
