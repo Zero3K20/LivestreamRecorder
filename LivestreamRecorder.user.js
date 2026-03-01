@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.3.0
+// @version      1.3.1
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -689,15 +689,13 @@
         }
         try {
             const fileHandle = await downloadDirHandle.getFileHandle(dl.filename, { create: true });
-            // Use the real on-disk file size — more reliable than the persisted bytesWritten.
-            // If the file was deleted between sessions, size will be 0 and the download restarts
-            // from scratch (safe for live streams; VOD will re-fetch from the beginning).
             const existingFile = await fileHandle.getFile();
             const startOffset  = existingFile.size;
-            if (startOffset === 0 && dl.bytesWritten > 0) {
-                console.warn('[LivestreamRecorder] Partial file lost; restarting download:', dl.filename);
-            }
-            dl.bytesWritten = startOffset;
+            // For live streams the FileSystem Access API swap file is discarded when the
+            // tab closes, so existingFile.size is often 0 even though progress was made.
+            // Always take the HIGHER of the persisted counter and the actual file size so
+            // the display never goes backwards and is never "synced" across downloads.
+            dl.bytesWritten = Math.max(dl.bytesWritten, startOffset);
             updateUI();
 
             const onProgress = _makeProgressCallback(dl);
@@ -1042,6 +1040,12 @@
             await _applyDirectoryHandle(handle);
             _resumeRestoredDownloads();
         });
+
+        // The debounced save is reset by each progress event and may never fire during
+        // continuous live-stream downloading.  This interval guarantees that bytesWritten
+        // for every active download is persisted at least once every 5 seconds, so a tab
+        // refresh always restores a reasonably fresh counter for each download.
+        setInterval(_persistDownloads, 5000);
     }
 
     if (document.readyState === 'loading') {
