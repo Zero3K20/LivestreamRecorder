@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.3.3
+// @version      1.3.4
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -343,6 +343,21 @@
             return;
         }
 
+        // Re-request write permission if it lapsed (e.g. new tab loaded a stored
+        // handle whose permission state is 'prompt').  requestPermission is safe
+        // here because startDownload is always triggered by a user gesture (button
+        // click).  If the user denies the prompt, bail out gracefully.
+        try {
+            const perm = await downloadDirHandle.requestPermission({ mode: 'readwrite' });
+            if (perm !== 'granted') {
+                alert('[Livestream Recorder] Write permission to the download directory was denied.');
+                return;
+            }
+        } catch (e) {
+            console.error('[LivestreamRecorder] requestPermission failed:', e);
+            return;
+        }
+
         const id = nextId++;
         const mime = streamMimeTypes.get(url) || '';
         const isHLS = /\.m3u8(\?|$)/i.test(url) || /[?&].*m3u8/i.test(url) ||
@@ -590,15 +605,17 @@
 
     /**
      * Apply a directory handle received from another tab or loaded from IDB.
-     * Only activates the handle if we already have 'granted' permission — avoids
-     * prompting the user without a gesture.
+     * Activates the handle when permission is already 'granted', or stores it
+     * when permission is 'prompt' so that the directory name is shown and the
+     * handle is ready for use the moment the user initiates an action (which
+     * will trigger requestPermission at that point).
      * @param {FileSystemDirectoryHandle} handle
      */
     async function _applyDirectoryHandle(handle) {
         if (!handle) return;
         try {
             const perm = await handle.queryPermission({ mode: 'readwrite' });
-            if (perm === 'granted') {
+            if (perm === 'granted' || perm === 'prompt') {
                 downloadDirHandle = handle;
                 if (elDirName) elDirName.textContent = handle.name;
             }
