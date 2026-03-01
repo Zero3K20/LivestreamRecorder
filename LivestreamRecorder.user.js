@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.1.0
+// @version      1.2.0
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -96,6 +96,12 @@
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;');
+    }
+
+    /** Returns a debounced wrapper of `fn` that fires after `delay` ms of inactivity. */
+    function _debounce(fn, delay) {
+        let timer;
+        return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), delay); };
     }
 
     // ─── GM_xmlhttpRequest wrapper ────────────────────────────────────────────────
@@ -356,15 +362,17 @@
                 stopSignal.stopped = true;
                 dl.status = 'stopped';
                 updateUI();
+                _persistDownloads();
             },
         };
 
         activeDownloads.set(id, dl);
         updateUI();
+        _persistDownloads();
 
         try {
             const fileHandle = await downloadDirHandle.getFileHandle(filename, { create: true });
-            const onProgress = (bytes) => { dl.bytesWritten += bytes; updateUI(); };
+            const onProgress = (bytes) => { dl.bytesWritten += bytes; updateUI(); _debouncedPersistDownloads(); };
 
             if (isHLS) {
                 await downloadHLS(url, fileHandle, onProgress, stopSignal);
@@ -379,6 +387,7 @@
         }
 
         updateUI();
+        _persistDownloads();
     }
 
     // ─── Stream detection ─────────────────────────────────────────────────────────
@@ -418,6 +427,7 @@
             if (mimeType) streamMimeTypes.set(url, mimeType);
             detectedStreams.add(url);
             updateUI();
+            _debouncedPersistStreams();
         }
     }
 
@@ -509,34 +519,40 @@
         });
     }
 
-    async function _saveHandleToIDB(handle) {
+    /** Generic IDB put — stores `value` under `key` in the `state` object store. */
+    async function _idbPut(key, value) {
         try {
             const db = await _openIDB();
             await new Promise((resolve, reject) => {
                 const tx = db.transaction('state', 'readwrite');
                 tx.oncomplete = resolve;
                 tx.onerror = () => reject(tx.error);
-                tx.objectStore('state').put(handle, 'dirHandle');
+                tx.objectStore('state').put(value, key);
             });
         } catch (e) {
-            console.warn('[LivestreamRecorder] Could not persist directory handle:', e);
+            console.warn('[LivestreamRecorder] IDB put failed:', key, e);
         }
     }
 
-    async function _loadHandleFromIDB() {
+    /** Generic IDB get — returns the value stored under `key`, or `null`. */
+    async function _idbGet(key) {
         try {
             const db = await _openIDB();
             return await new Promise((resolve, reject) => {
                 const tx = db.transaction('state', 'readonly');
-                const req = tx.objectStore('state').get('dirHandle');
-                req.onsuccess = () => resolve(req.result || null);
+                const req = tx.objectStore('state').get(key);
+                req.onsuccess = () => resolve(req.result ?? null);
                 req.onerror = () => reject(req.error);
             });
         } catch (e) {
-            console.warn('[LivestreamRecorder] Could not load directory handle:', e);
+            console.warn('[LivestreamRecorder] IDB get failed:', key, e);
             return null;
         }
     }
+
+    async function _saveHandleToIDB(handle) { await _idbPut('dirHandle', handle); }
+
+    async function _loadHandleFromIDB() { return _idbGet('dirHandle'); }
 
     /**
      * Apply a directory handle received from another tab or loaded from IDB.
@@ -555,6 +571,72 @@
         } catch (e) {
             console.warn('[LivestreamRecorder] Directory handle permission check failed:', e);
         }
+    }
+
+    // ─── State persistence ────────────────────────────────────────────────────────
+
+    /** Persist the detected-streams state to IDB (debounced). */
+    async function _persistDetectedStreams() {
+        await _idbPut('detectedStreams',      [...detectedStreams]);
+        await _idbPut('streamMimeTypes',      [...streamMimeTypes.entries()]);
+        await _idbPut('detectedM3U8Prefixes', [...detectedM3U8Prefixes]);
+    }
+
+    /** Persist the download-history state to IDB (debounced on progress; immediate on finals). */
+    async function _persistDownloads() {
+        const snapshot = [...activeDownloads.values()].map((dl) => ({
+            id:           dl.id,
+            url:          dl.url,
+            filename:     dl.filename,
+            status:       dl.status,
+            bytesWritten: dl.bytesWritten,
+        }));
+        await _idbPut('downloads', snapshot);
+        await _idbPut('nextId',    nextId);
+    }
+
+    const _debouncedPersistStreams   = _debounce(_persistDetectedStreams, 500);
+    const _debouncedPersistDownloads = _debounce(_persistDownloads, 500);
+
+    /**
+     * Restore persisted state on load.
+     * Downloads that were `downloading` when the tab closed are shown as `interrupted`.
+     */
+    async function _restoreState() {
+        const [streams, mimeEntries, m3u8Prefixes, downloads, savedNextId] = await Promise.all([
+            _idbGet('detectedStreams'),
+            _idbGet('streamMimeTypes'),
+            _idbGet('detectedM3U8Prefixes'),
+            _idbGet('downloads'),
+            _idbGet('nextId'),
+        ]);
+
+        if (Array.isArray(streams))      streams.forEach((url)      => detectedStreams.add(url));
+        if (Array.isArray(mimeEntries))  mimeEntries.forEach(([url, mimeType]) => streamMimeTypes.set(url, mimeType));
+        if (Array.isArray(m3u8Prefixes)) m3u8Prefixes.forEach((prefix) => detectedM3U8Prefixes.add(prefix));
+
+        if (Array.isArray(downloads)) {
+            downloads.forEach((saved) => {
+                // Downloads that were in-flight when the tab closed are now interrupted.
+                const status = saved.status === 'downloading' ? 'interrupted' : saved.status;
+                activeDownloads.set(saved.id, {
+                    id:           saved.id,
+                    url:          saved.url,
+                    filename:     saved.filename,
+                    status,
+                    bytesWritten: saved.bytesWritten,
+                    stopSignal:   { stopped: true },
+                    // stop() is a no-op on restored entries — the download is already
+                    // interrupted and cannot be resumed; the stub satisfies the interface
+                    // expected by updateUI().
+                    stop()        {},
+                });
+            });
+        }
+
+        if (typeof savedNextId === 'number' && savedNextId > nextId) nextId = savedNextId;
+
+        updateUI();
     }
 
     // ─── UI ───────────────────────────────────────────────────────────────────────
@@ -626,6 +708,7 @@
 .lsr-status-downloading { color: #3498db; }
 .lsr-status-completed  { color: #27ae60; }
 .lsr-status-stopped    { color: #e67e22; }
+.lsr-status-interrupted{ color: #e67e22; }
 .lsr-status-error      { color: #e74c3c; }
 .lsr-stop-btn {
     background: #922b21; border: none; color: #fff;
@@ -643,6 +726,11 @@
 }
 .lsr-add-btn:hover { background: #27ae60; }
 .lsr-empty { font-size: 11px; color: #5d6d7e; font-style: italic; }
+.lsr-clear-btn {
+    background: none; border: none; color: #5d6d7e; cursor: pointer;
+    font-size: 10px; text-decoration: underline; padding: 0; float: right;
+}
+.lsr-clear-btn:hover { color: #e74c3c; }
 `;
 
     function injectCSS() {
@@ -673,7 +761,7 @@
     <div class="lsr-dir-name" id="lsr-dir-name">No directory selected</div>
   </div>
   <div class="lsr-section">
-    <div class="lsr-label">Detected Streams</div>
+    <div class="lsr-label">Detected Streams <button class="lsr-clear-btn" id="lsr-clear-streams">Clear</button></div>
     <div id="lsr-detected"></div>
     <div class="lsr-add-row">
       <input class="lsr-url-input" id="lsr-manual-url" type="text" placeholder="Or paste a stream URL…"/>
@@ -681,7 +769,7 @@
     </div>
   </div>
   <div class="lsr-section">
-    <div class="lsr-label">Active Downloads</div>
+    <div class="lsr-label">Downloads <button class="lsr-clear-btn" id="lsr-clear-downloads">Clear</button></div>
     <div id="lsr-active"></div>
   </div>
 </div>`;
@@ -699,6 +787,8 @@
         panel.querySelector('#lsr-manual-url').addEventListener('keydown', (e) => {
             if (e.key === 'Enter') addManualURL();
         });
+        panel.querySelector('#lsr-clear-streams').addEventListener('click', clearDetectedStreams);
+        panel.querySelector('#lsr-clear-downloads').addEventListener('click', clearDownloads);
 
         makeDraggable(panel, panel.querySelector('#lsr-header'));
         updateUI();
@@ -709,6 +799,23 @@
         if (!input) return;
         const url = input.value.trim();
         if (url) { addDetectedStream(url); input.value = ''; }
+    }
+
+    function clearDetectedStreams() {
+        detectedStreams.clear();
+        streamMimeTypes.clear();
+        detectedM3U8Prefixes.clear();
+        updateUI();
+        _persistDetectedStreams();
+    }
+
+    function clearDownloads() {
+        // Only remove downloads that are no longer active.
+        for (const [id, dl] of activeDownloads) {
+            if (dl.status !== 'downloading') activeDownloads.delete(id);
+        }
+        updateUI();
+        _persistDownloads();
     }
 
     function toggleMinimize() {
@@ -831,7 +938,8 @@
             }
         };
 
-        // Restore last-used directory handle from a previous session / page load.
+        // Restore all persisted state (streams, downloads, directory handle) from IDB.
+        _restoreState();
         _loadHandleFromIDB().then(_applyDirectoryHandle);
     }
 
