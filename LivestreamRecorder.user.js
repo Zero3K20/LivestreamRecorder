@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.3.4
+// @version      1.3.5
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -343,19 +343,25 @@
             return;
         }
 
-        // Re-request write permission if it lapsed (e.g. new tab loaded a stored
-        // handle whose permission state is 'prompt').  requestPermission is safe
-        // here because startDownload is always triggered by a user gesture (button
-        // click).  If the user denies the prompt, bail out gracefully.
+        // Re-request write permission only when needed (e.g. new tab loaded a stored
+        // handle whose permission state is 'prompt').  requestPermission is safe here
+        // because startDownload is always triggered by a user gesture (button click).
+        // We skip the round-trip when permission is already 'granted' so normal
+        // same-tab downloads are unaffected.  If requestPermission throws for any
+        // reason we warn and continue — the actual file write will surface a real
+        // permission error if one exists, and the download entry will still be
+        // recorded so it persists across refreshes.
         try {
-            const perm = await downloadDirHandle.requestPermission({ mode: 'readwrite' });
-            if (perm !== 'granted') {
-                alert('[Livestream Recorder] Write permission to the download directory was denied.');
-                return;
+            const currentPerm = await downloadDirHandle.queryPermission({ mode: 'readwrite' });
+            if (currentPerm !== 'granted') {
+                const newPerm = await downloadDirHandle.requestPermission({ mode: 'readwrite' });
+                if (newPerm !== 'granted') {
+                    alert('[Livestream Recorder] Write permission to the download directory was denied.');
+                    return;
+                }
             }
         } catch (e) {
-            console.error('[LivestreamRecorder] requestPermission failed:', e);
-            return;
+            console.warn('[LivestreamRecorder] Permission check failed, attempting download anyway:', e);
         }
 
         const id = nextId++;
