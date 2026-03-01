@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.3.6
+// @version      1.3.7
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @connect      *
 // @run-at       document-idle
 // ==/UserScript==
@@ -650,13 +652,14 @@
             status:       dl.status,
             bytesWritten: dl.bytesWritten,
         }));
-        // Write synchronously to localStorage BEFORE the async IDB write.
-        // This acts as an emergency backup if the IDB transaction doesn't
-        // commit before the page is refreshed/closed.
+        // Write the backup via GM_setValue BEFORE the async IDB write.
+        // GM_setValue is synchronous in Tampermonkey and works correctly in
+        // all sandbox modes (unlike localStorage, which is isolated from the
+        // page's storage when any @grant value is declared).
         try {
-            localStorage.setItem('__LSR_downloads__', JSON.stringify(snapshot));
-            localStorage.setItem('__LSR_nextId__',    String(nextId));
-        } catch (e) { /* storage may be full or unavailable */ }
+            GM_setValue('__LSR_downloads__', JSON.stringify(snapshot));
+            GM_setValue('__LSR_nextId__',    String(nextId));
+        } catch (e) { console.warn('[LivestreamRecorder] GM_setValue backup failed:', e); }
         await _idbPut('downloads', snapshot);
         await _idbPut('nextId',    nextId);
     }
@@ -680,20 +683,20 @@
 
         // If IDB has no downloads entry (key was never written because the
         // page was refreshed before the async IDB transaction committed),
-        // fall back to the synchronous localStorage backup written at the
+        // fall back to the GM_setValue backup written synchronously at the
         // start of every _persistDownloads() call.
         if (downloads === null) {
             try {
-                const raw = localStorage.getItem('__LSR_downloads__');
+                const raw = GM_getValue('__LSR_downloads__', null);
                 if (raw) {
                     downloads = JSON.parse(raw);
-                    const rawId = localStorage.getItem('__LSR_nextId__');
+                    const rawId = GM_getValue('__LSR_nextId__', null);
                     if (rawId !== null && savedNextId === null) {
                         const parsed = parseInt(rawId, 10);
                         if (!isNaN(parsed)) savedNextId = parsed;
                     }
                 }
-            } catch (e) { /* corrupt or unavailable */ }
+            } catch (e) { /* corrupt data */ }
         }
 
         if (Array.isArray(streams))      streams.forEach((url)      => detectedStreams.add(url));
