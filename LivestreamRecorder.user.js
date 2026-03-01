@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.3.5
+// @version      1.3.6
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -581,7 +581,8 @@
             await new Promise((resolve, reject) => {
                 const tx = db.transaction('state', 'readwrite');
                 tx.oncomplete = resolve;
-                tx.onerror = () => reject(tx.error);
+                tx.onerror  = () => reject(tx.error);
+                tx.onabort  = () => reject(tx.error || new Error('IDB transaction aborted'));
                 tx.objectStore('state').put(value, key);
             });
         } catch (e) {
@@ -649,6 +650,13 @@
             status:       dl.status,
             bytesWritten: dl.bytesWritten,
         }));
+        // Write synchronously to localStorage BEFORE the async IDB write.
+        // This acts as an emergency backup if the IDB transaction doesn't
+        // commit before the page is refreshed/closed.
+        try {
+            localStorage.setItem('__LSR_downloads__', JSON.stringify(snapshot));
+            localStorage.setItem('__LSR_nextId__',    String(nextId));
+        } catch (e) { /* storage may be full or unavailable */ }
         await _idbPut('downloads', snapshot);
         await _idbPut('nextId',    nextId);
     }
@@ -662,13 +670,31 @@
      * all other terminal statuses are shown as-is.
      */
     async function _restoreState() {
-        const [streams, mimeEntries, m3u8Prefixes, downloads, savedNextId] = await Promise.all([
+        let [streams, mimeEntries, m3u8Prefixes, downloads, savedNextId] = await Promise.all([
             _idbGet('detectedStreams'),
             _idbGet('streamMimeTypes'),
             _idbGet('detectedM3U8Prefixes'),
             _idbGet('downloads'),
             _idbGet('nextId'),
         ]);
+
+        // If IDB has no downloads entry (key was never written because the
+        // page was refreshed before the async IDB transaction committed),
+        // fall back to the synchronous localStorage backup written at the
+        // start of every _persistDownloads() call.
+        if (downloads === null) {
+            try {
+                const raw = localStorage.getItem('__LSR_downloads__');
+                if (raw) {
+                    downloads = JSON.parse(raw);
+                    const rawId = localStorage.getItem('__LSR_nextId__');
+                    if (rawId !== null && savedNextId === null) {
+                        const parsed = parseInt(rawId, 10);
+                        if (!isNaN(parsed)) savedNextId = parsed;
+                    }
+                }
+            } catch (e) { /* corrupt or unavailable */ }
+        }
 
         if (Array.isArray(streams))      streams.forEach((url)      => detectedStreams.add(url));
         if (Array.isArray(mimeEntries))  mimeEntries.forEach(([url, mimeType]) => streamMimeTypes.set(url, mimeType));
