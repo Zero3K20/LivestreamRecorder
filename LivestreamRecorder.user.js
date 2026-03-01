@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.0.0
+// @version      1.1.0
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -19,6 +19,9 @@
     /** Maximum number of characters shown for a stream URL in the detected-streams list. */
     const MAX_DISPLAYED_URL_LENGTH = 55;
 
+    /** Content-Type values that identify a live stream regardless of URL extension. */
+    const STREAM_MIME_RE = /video\/x-flv|video\/mp2t|application\/(x-mpegurl|vnd\.apple\.mpegurl)/i;
+
     // ─── State ───────────────────────────────────────────────────────────────────
 
     /** @type {FileSystemDirectoryHandle|null} */
@@ -33,6 +36,16 @@
 
     /** Set of stream URLs discovered on the page. @type {Set<string>} */
     const detectedStreams = new Set();
+
+    /** MIME types associated with detected stream URLs. @type {Map<string, string>} */
+    const streamMimeTypes = new Map();
+
+    /**
+     * Directory prefixes of detected .m3u8 playlists, used to suppress individual
+     * .ts segment URLs from flooding the detected-streams list.
+     * @type {Set<string>}
+     */
+    const detectedM3U8Prefixes = new Set();
 
     let nextId = 1;
 
@@ -65,6 +78,16 @@
         }
         const ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
         return sanitizeFilename(`${base}_${ts}.${ext}`);
+    }
+
+    /** Returns the directory prefix of a URL (origin + path up to the last slash). */
+    function getURLDirectory(url) {
+        try {
+            const u = new URL(url);
+            const parts = u.pathname.split('/');
+            parts.pop(); // remove filename
+            return u.origin + parts.join('/') + '/';
+        } catch { return null; }
     }
 
     function escapeHTML(str) {
@@ -303,14 +326,21 @@
         }
 
         const id = nextId++;
-        const isHLS = /\.m3u8(\?|$)/i.test(url) || /[?&].*m3u8/i.test(url);
+        const mime = streamMimeTypes.get(url) || '';
+        const isHLS = /\.m3u8(\?|$)/i.test(url) || /[?&].*m3u8/i.test(url) ||
+                      /application\/(x-mpegurl|vnd\.apple\.mpegurl)/i.test(mime);
         let ext = 'ts';
         if (!isHLS) {
-            try {
-                const pathname = new URL(url).pathname;
-                const raw = pathname.split('.').pop().split('?')[0].toLowerCase();
-                ext = raw || 'mp4';
-            } catch { ext = 'mp4'; }
+            if (/video\/x-flv/i.test(mime)) {
+                ext = 'flv';
+            } else {
+                try {
+                    const pathname = new URL(url).pathname;
+                    const raw = pathname.split('.').pop().split('?')[0].toLowerCase();
+                    // Accept 2-5 character extensions (covers common formats like .ts, .mp4, .webm, .m4s).
+                    ext = /^[a-z0-9]{2,5}$/.test(raw) ? raw : 'mp4';
+                } catch { ext = 'mp4'; }
+            }
         }
 
         const filename = generateFilename(url, ext);
@@ -359,43 +389,172 @@
         return typeof url === 'string' && STREAM_RE.test(url);
     }
 
-    function addDetectedStream(url) {
+    /**
+     * Add a stream URL to the detected list.
+     * Suppresses individual .ts segments when the parent .m3u8 playlist has already
+     * been detected (same directory prefix).
+     * @param {string} url
+     * @param {string} [mimeType]
+     */
+    function addDetectedStream(url, mimeType) {
         if (typeof url !== 'string' || !url.startsWith('http')) return;
+
+        const isM3U8 = /\.m3u8(\?|$)/i.test(url);
+        const isTS   = /\.ts(\?|$)/i.test(url);
+
+        // Track m3u8 directory prefixes so we can suppress individual segments.
+        if (isM3U8) {
+            const dir = getURLDirectory(url);
+            if (dir) detectedM3U8Prefixes.add(dir);
+        }
+
+        // Suppress .ts segments that belong to a known HLS playlist directory.
+        if (isTS) {
+            const dir = getURLDirectory(url);
+            if (dir && detectedM3U8Prefixes.has(dir)) return;
+        }
+
         if (!detectedStreams.has(url)) {
+            if (mimeType) streamMimeTypes.set(url, mimeType);
             detectedStreams.add(url);
             updateUI();
         }
     }
 
-    // Hook XMLHttpRequest
+    // Hook XMLHttpRequest — URL-pattern check on open(); MIME-type check on send().
     const _xhrOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (method, url, ...rest) {
         try {
             const full = resolveURL(location.href, String(url));
+            this._lsrUrl = full;
             if (isStreamURL(full)) addDetectedStream(full);
         } catch { /* ignore */ }
         return _xhrOpen.call(this, method, url, ...rest);
     };
 
-    // Hook fetch
+    const _xhrSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function (...args) {
+        const lsrUrl = this._lsrUrl;
+        if (lsrUrl) {
+            // Use a named handler so it can remove itself after firing once.
+            const onStateChange = function () {
+                if (this.readyState === /* HEADERS_RECEIVED */ 2) {
+                    this.removeEventListener('readystatechange', onStateChange);
+                    try {
+                        const ct = this.getResponseHeader('Content-Type') || '';
+                        if (STREAM_MIME_RE.test(ct)) addDetectedStream(lsrUrl, ct);
+                    } catch { /* cross-origin XHR may throw */ }
+                }
+            };
+            this.addEventListener('readystatechange', onStateChange);
+        }
+        return _xhrSend.apply(this, args);
+    };
+
+    // Hook fetch — URL-pattern check immediately; MIME-type check on response (only
+    // when the URL didn't already match, to avoid overhead on every non-stream fetch).
     const _fetch = window.fetch;
     window.fetch = function (input, ...rest) {
+        let full;
         try {
             const url = typeof input === 'string' ? input : (input && input.url) || '';
-            const full = resolveURL(location.href, url);
-            if (isStreamURL(full)) addDetectedStream(full);
-        } catch { /* ignore */ }
+            full = resolveURL(location.href, url);
+        } catch { full = ''; }
+        if (full) {
+            const urlMatched = isStreamURL(full);
+            if (urlMatched) addDetectedStream(full);
+            const promise = _fetch.call(this, input, ...rest);
+            if (!urlMatched) {
+                // Only inspect response MIME type for URLs that didn't match by extension.
+                promise.then((response) => {
+                    try {
+                        const ct = response.headers.get('content-type') || '';
+                        if (STREAM_MIME_RE.test(ct)) addDetectedStream(full, ct);
+                    } catch { /* ignore */ }
+                }).catch(() => {});
+            }
+            return promise;
+        }
         return _fetch.call(this, input, ...rest);
     };
 
-    // Scan existing <video src> / <source src> elements
+    // Scan existing <video src> / <source src> elements, including their type attributes.
     function scanPageElements() {
         document.querySelectorAll('video[src], source[src]').forEach((el) => {
             try {
-                const full = resolveURL(location.href, el.src || el.getAttribute('src'));
-                if (isStreamURL(full)) addDetectedStream(full);
+                const src  = el.src || el.getAttribute('src') || '';
+                const type = el.type || el.getAttribute('type') || '';
+                const full = resolveURL(location.href, src);
+                if (isStreamURL(full) || STREAM_MIME_RE.test(type)) {
+                    addDetectedStream(full, type || undefined);
+                }
             } catch { /* ignore */ }
         });
+    }
+
+    // ─── Cross-tab directory sync (BroadcastChannel + IndexedDB) ─────────────────
+
+    /**
+     * BroadcastChannel used to propagate directory-handle changes to other tabs on
+     * the same origin running this script.
+     */
+    const DIR_CHANNEL = new BroadcastChannel('lsr-dir-channel');
+
+    function _openIDB() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open('LivestreamRecorder', 1);
+            req.onupgradeneeded = () => req.result.createObjectStore('state');
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    async function _saveHandleToIDB(handle) {
+        try {
+            const db = await _openIDB();
+            await new Promise((resolve, reject) => {
+                const tx = db.transaction('state', 'readwrite');
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error);
+                tx.objectStore('state').put(handle, 'dirHandle');
+            });
+        } catch (e) {
+            console.warn('[LivestreamRecorder] Could not persist directory handle:', e);
+        }
+    }
+
+    async function _loadHandleFromIDB() {
+        try {
+            const db = await _openIDB();
+            return await new Promise((resolve, reject) => {
+                const tx = db.transaction('state', 'readonly');
+                const req = tx.objectStore('state').get('dirHandle');
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            console.warn('[LivestreamRecorder] Could not load directory handle:', e);
+            return null;
+        }
+    }
+
+    /**
+     * Apply a directory handle received from another tab or loaded from IDB.
+     * Only activates the handle if we already have 'granted' permission — avoids
+     * prompting the user without a gesture.
+     * @param {FileSystemDirectoryHandle} handle
+     */
+    async function _applyDirectoryHandle(handle) {
+        if (!handle) return;
+        try {
+            const perm = await handle.queryPermission({ mode: 'readwrite' });
+            if (perm === 'granted') {
+                downloadDirHandle = handle;
+                if (elDirName) elDirName.textContent = handle.name;
+            }
+        } catch (e) {
+            console.warn('[LivestreamRecorder] Directory handle permission check failed:', e);
+        }
     }
 
     // ─── UI ───────────────────────────────────────────────────────────────────────
@@ -573,6 +732,9 @@
         try {
             downloadDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
             if (elDirName) elDirName.textContent = downloadDirHandle.name;
+            // Persist to IDB and notify other tabs.
+            await _saveHandleToIDB(downloadDirHandle);
+            DIR_CHANNEL.postMessage({ type: 'dirChanged', handle: downloadDirHandle });
         } catch (e) {
             if (e.name !== 'AbortError') console.error('[LivestreamRecorder]', e);
         }
@@ -661,6 +823,16 @@
         // Watch for dynamically added <video>/<source> elements.
         const mo = new MutationObserver(scanPageElements);
         mo.observe(document.documentElement, { childList: true, subtree: true });
+
+        // Sync directory handle from other tabs in real time.
+        DIR_CHANNEL.onmessage = (e) => {
+            if (e.data && e.data.type === 'dirChanged' && e.data.handle) {
+                _applyDirectoryHandle(e.data.handle);
+            }
+        };
+
+        // Restore last-used directory handle from a previous session / page load.
+        _loadHandleFromIDB().then(_applyDirectoryHandle);
     }
 
     if (document.readyState === 'loading') {
