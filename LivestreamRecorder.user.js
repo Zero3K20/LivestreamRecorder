@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.3.2
+// @version      1.3.3
 // @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -1057,16 +1057,22 @@
 
         // Restore all persisted state (streams, downloads, directory handle) from IDB,
         // then resume any downloads that were active when the tab was last unloaded.
+        // The periodic flush interval is started here — after _restoreState has fully
+        // populated activeDownloads — so its very first snapshot is never empty.
+        // Starting it before the restore completes would let it capture an empty
+        // activeDownloads snapshot which (due to the FIFO IDB write ordering) would
+        // then be committed to IDB *after* the reads, wiping the persisted downloads.
         Promise.all([_restoreState(), _loadHandleFromIDB()]).then(async ([, handle]) => {
             await _applyDirectoryHandle(handle);
             _resumeRestoredDownloads();
-        });
 
-        // The debounced save is reset by each progress event and may never fire during
-        // continuous live-stream downloading.  This interval guarantees that bytesWritten
-        // for every active download is persisted at least once every 5 seconds, so a tab
-        // refresh always restores a reasonably fresh counter for each download.
-        setInterval(_persistDownloads, 5000);
+            // The debounced save is reset by each progress event and may never fire
+            // during continuous live-stream downloading.  This interval guarantees
+            // that bytesWritten for every active download is persisted at least once
+            // every 5 seconds, so a tab refresh always restores a reasonably fresh
+            // counter for each download.
+            setInterval(_persistDownloads, 5000);
+        });
     }
 
     if (document.readyState === 'loading') {
