@@ -3,9 +3,11 @@
 
 // ─── Storage keys (must match background.js) ─────────────────────────────────
 
-const S_STREAMS = 'lsr_streams';
-const S_MIMES   = 'lsr_mimes';
-const S_DLS     = 'lsr_downloads';
+const S_STREAMS  = 'lsr_streams';
+const S_MIMES    = 'lsr_mimes';
+const S_DLS      = 'lsr_downloads';
+/** Persisted directory name string — reliable across popup open/close and browser restarts. */
+const S_SAVE_DIR = 'lsr_save_dir';
 
 /** Maximum URL characters shown in the detected-streams list. */
 const MAX_URL_LEN = 55;
@@ -278,10 +280,28 @@ document.getElementById('btn-select-dir').addEventListener('click', async () => 
     try {
         const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
         saveDirHandleRef = handle;
-        await saveDirHandleToIDB(handle);
+
+        // Persist the directory name as a plain string in chrome.storage.local.
+        // This is the canonical, always-reliable store for the label and the
+        // user's intent.  The FileSystemDirectoryHandle is written to IDB as a
+        // best-effort cache that enables direct writes without re-prompting —
+        // handle objects can become invalid across browser restarts, so the
+        // name string is what we rely on for display and re-prompt guidance.
+        await chrome.storage.local.set({ [S_SAVE_DIR]: handle.name });
+
+        // Best-effort: cache the live handle in IDB for same-session direct writes.
+        try {
+            await saveDirHandleToIDB(handle);
+        } catch (idbErr) {
+            console.warn('[LSR] Could not cache directory handle in IDB:', idbErr);
+        }
+
         document.getElementById('dir-name').textContent = handle.name;
     } catch (e) {
-        if (e.name !== 'AbortError') console.error('[LSR]', e);
+        if (e.name !== 'AbortError') {
+            console.error('[LSR] Directory picker error:', e);
+            alert('Could not select directory: ' + e.message);
+        }
     }
 });
 
@@ -292,27 +312,68 @@ document.getElementById('btn-select-dir').addEventListener('click', async () => 
 
 chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
-    if (S_DLS     in changes) renderDownloads();
-    if (S_STREAMS in changes) renderStreams();
+    if (S_DLS      in changes) renderDownloads();
+    if (S_STREAMS  in changes) renderStreams();
+    if (S_SAVE_DIR in changes) {
+        const name = changes[S_SAVE_DIR].newValue;
+        document.getElementById('dir-name').textContent = name || 'No directory selected — files saved via Save dialog';
+    }
 });
 
 // ─── Initialise ───────────────────────────────────────────────────────────────
 
 (async () => {
-    // Restore the saved directory handle (may need permission re-request on click).
+    const label = document.getElementById('dir-name');
+
+    // ── Step 1: show the persisted directory name from chrome.storage.local ───
+    // This is always reliable — it persists across popup open/close and browser
+    // restarts, unlike FileSystemDirectoryHandle objects stored in IDB.
+    const stored = await chrome.storage.local.get(S_SAVE_DIR);
+    const savedName = stored[S_SAVE_DIR] || null;
+
+    if (savedName) {
+        // Tentatively show the name; we'll refine it once we know whether the
+        // live handle is still valid (step 2 below).
+        label.textContent = savedName + ' (re-authorizing…)';
+    }
+
+    // ── Step 2: try to load the live handle from IDB ──────────────────────────
+    // If this succeeds AND permission is still granted, we can do direct writes
+    // to the directory without re-prompting.  If it fails for any reason we
+    // fall back to showSaveFilePicker — but we still show the saved name so the
+    // user knows which directory they chose.
     try {
         const handle = await loadDirHandle();
         if (handle) {
-            saveDirHandleRef = handle;
             const perm = await handle.queryPermission({ mode: 'readwrite' });
-            const label = document.getElementById('dir-name');
-            // Show the directory name regardless of current permission state.
-            // Permission can be re-requested on the next user gesture (save/record).
-            label.textContent = perm === 'granted'
-                ? handle.name
-                : handle.name + ' (click Save to re-authorise)';
+            if (perm === 'granted' || perm === 'prompt') {
+                saveDirHandleRef = handle;
+                // Update the chrome.storage.local name in case the folder was
+                // renamed since the last session (IDB handle stays in sync).
+                if (handle.name !== savedName) {
+                    await chrome.storage.local.set({ [S_SAVE_DIR]: handle.name });
+                }
+                label.textContent = perm === 'granted'
+                    ? handle.name
+                    : handle.name + ' (click Select Directory to re-authorise)';
+            } else {
+                // Permission explicitly denied — tell the user clearly.
+                label.textContent = (savedName || 'Directory') + ' (permission denied — click Select to re-choose)';
+            }
+        } else if (savedName) {
+            // Handle not in IDB (e.g., first open after browser restart) but we
+            // know the name.  Prompt the user to re-select so we can get a fresh
+            // handle with valid permission.
+            label.textContent = savedName + ' (click Select Directory to re-authorise)';
         }
-    } catch { /* handle may be stale */ }
+    } catch (err) {
+        // IDB read or permission check failed.  The name from chrome.storage.local
+        // is still shown; the user can re-select to get a fresh handle.
+        console.warn('[LSR] Could not load directory handle from IDB:', err);
+        if (savedName) {
+            label.textContent = savedName + ' (click Select Directory to re-authorise)';
+        }
+    }
 
     render();
 })();
