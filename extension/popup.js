@@ -272,37 +272,19 @@ document.getElementById('btn-clear-downloads').addEventListener('click', async (
     renderDownloads();
 });
 
-document.getElementById('btn-select-dir').addEventListener('click', async () => {
-    if (typeof window.showDirectoryPicker !== 'function') {
-        alert('The File System Access API is not available.\nPlease use Chrome 86+ or another Chromium-based browser.');
-        return;
-    }
-    try {
-        const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
-        saveDirHandleRef = handle;
-
-        // Persist the directory name as a plain string in chrome.storage.local.
-        // This is the canonical, always-reliable store for the label and the
-        // user's intent.  The FileSystemDirectoryHandle is written to IDB as a
-        // best-effort cache that enables direct writes without re-prompting —
-        // handle objects can become invalid across browser restarts, so the
-        // name string is what we rely on for display and re-prompt guidance.
-        await chrome.storage.local.set({ [S_SAVE_DIR]: handle.name });
-
-        // Best-effort: cache the live handle in IDB for same-session direct writes.
-        try {
-            await saveDirHandleToIDB(handle);
-        } catch (idbErr) {
-            console.warn('[LSR] Could not cache directory handle in IDB:', idbErr);
-        }
-
-        document.getElementById('dir-name').textContent = handle.name;
-    } catch (e) {
-        if (e.name !== 'AbortError') {
-            console.error('[LSR] Directory picker error:', e);
-            alert('Could not select directory: ' + e.message);
-        }
-    }
+document.getElementById('btn-select-dir').addEventListener('click', () => {
+    // showDirectoryPicker() causes Chrome to destroy the popup before the
+    // native dialog opens, so the promise never resolves in this context and
+    // nothing can be saved.  Instead we open a dedicated small window that
+    // persists through the native dialog and writes the result to
+    // chrome.storage.local (and IDB) before closing itself.
+    chrome.windows.create({
+        url:     chrome.runtime.getURL('select-dir.html'),
+        type:    'popup',
+        width:   420,
+        height:  160,
+        focused: true,
+    });
 });
 
 // ─── Real-time updates via storage change listener ────────────────────────────
