@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.3
+// @version      1.4.4
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -55,6 +55,13 @@
 
     /** Set of stream URLs discovered on the page. @type {Set<string>} */
     const detectedStreams = new Set();
+
+    /**
+     * Map of live WebRTC MediaStream objects keyed by their synthetic `webrtc://` URL.
+     * Populated by the srcObject hook; used by downloadMediaRecorder.
+     * @type {Map<string, MediaStream>}
+     */
+    const _webrtcStreams = new Map();
 
     /** MIME types associated with detected stream URLs. @type {Map<string, string>} */
     const streamMimeTypes = new Map();
@@ -430,6 +437,79 @@
         }
     }
 
+    // ─── WebRTC stream recorder (MediaRecorder) ───────────────────────────────────
+
+    /**
+     * Record a live WebRTC MediaStream using the browser's MediaRecorder API.
+     * Each data chunk is written directly to disk as it arrives.
+     * Cannot be resumed after stopping because the stream is live.
+     *
+     * @param {string} url - synthetic webrtc:// URL used as the MediaStream key
+     * @param {FileSystemFileHandle} fileHandle
+     * @param {function(number): void} onProgress
+     * @param {{ stopped: boolean }} stopSignal
+     */
+    async function downloadMediaRecorder(url, fileHandle, onProgress, stopSignal) {
+        const stream = _webrtcStreams.get(url);
+        if (!stream) throw new Error('WebRTC stream is no longer available (reload the page and try again)');
+        const writable = await fileHandle.createWritable({ keepExistingData: false });
+        try {
+            await new Promise((resolve, reject) => {
+                const mimeType = [
+                    'video/webm;codecs=vp9,opus',
+                    'video/webm;codecs=vp8,opus',
+                    'video/webm',
+                ].find((m) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) || 'video/webm';
+
+                let recorder;
+                try {
+                    recorder = new MediaRecorder(stream, { mimeType });
+                } catch (e) {
+                    reject(new Error('MediaRecorder creation failed: ' + e.message));
+                    return;
+                }
+
+                let stopCheckTimer = null;
+
+                const clearStopTimer = () => {
+                    if (stopCheckTimer !== null) { clearInterval(stopCheckTimer); stopCheckTimer = null; }
+                };
+
+                recorder.ondataavailable = async (e) => {
+                    if (!e.data || e.data.size === 0) return;
+                    try {
+                        const buf = await e.data.arrayBuffer();
+                        await writable.write(buf);
+                        onProgress(buf.byteLength);
+                    } catch (writeErr) {
+                        clearStopTimer();
+                        if (recorder.state !== 'inactive') recorder.stop();
+                        reject(writeErr);
+                    }
+                };
+
+                recorder.onerror = (e) => {
+                    clearStopTimer();
+                    reject(e.error || new Error('MediaRecorder error'));
+                };
+
+                recorder.onstop = resolve;
+
+                // 500 ms chunks give smooth progress updates without excessive overhead.
+                recorder.start(500);
+
+                stopCheckTimer = setInterval(() => {
+                    if (stopSignal.stopped && recorder.state !== 'inactive') {
+                        clearStopTimer();
+                        recorder.stop();
+                    }
+                }, 250);
+            });
+        } finally {
+            await writable.close();
+        }
+    }
+
     // ─── Start / stop downloads ───────────────────────────────────────────────────
 
     /** Creates the standard progress callback used by both startDownload and resumeDownload. */
@@ -466,17 +546,18 @@
 
         const id = nextId++;
         const mime = streamMimeTypes.get(url) || '';
-        const isWS  = /^wss?:\/\//i.test(url);
-        const isHLS = !isWS && (/\.m3u8(\?|$)/i.test(url) || /[?&].*m3u8/i.test(url) ||
-                      /application\/(x-mpegurl|vnd\.apple\.mpegurl)/i.test(mime));
-        let ext = isHLS ? 'ts' : 'mp4';
+        const isWS     = /^wss?:\/\//i.test(url);
+        const isWebRTC = url.startsWith('webrtc://');
+        const isHLS    = !isWS && !isWebRTC && (/\.m3u8(\?|$)/i.test(url) || /[?&].*m3u8/i.test(url) ||
+                          /application\/(x-mpegurl|vnd\.apple\.mpegurl)/i.test(mime));
+        let ext = isHLS ? 'ts' : isWebRTC ? 'webm' : 'mp4';
         if (isWS) {
             try {
                 const pathname = new URL(url).pathname;
                 const raw = pathname.split('.').pop().split('?')[0].toLowerCase();
                 ext = /^[a-z0-9]{2,5}$/.test(raw) ? raw : 'bin';
             } catch { ext = 'bin'; }
-        } else if (!isHLS) {
+        } else if (!isHLS && !isWebRTC) {
             if (/video\/x-flv/i.test(mime)) {
                 ext = 'flv';
             } else {
@@ -497,6 +578,7 @@
             filename,
             isHLS,
             isWS,
+            isWebRTC,
             status: 'downloading',
             bytesWritten: 0,
             stopSignal,
@@ -520,6 +602,8 @@
                 await downloadHLS(url, fileHandle, onProgress, stopSignal);
             } else if (isWS) {
                 await downloadWebSocket(url, fileHandle, onProgress, stopSignal);
+            } else if (isWebRTC) {
+                await downloadMediaRecorder(url, fileHandle, onProgress, stopSignal);
             } else {
                 await downloadDirect(url, fileHandle, onProgress, stopSignal);
             }
@@ -556,7 +640,7 @@
      * @param {string} [mimeType]
      */
     function addDetectedStream(url, mimeType) {
-        if (typeof url !== 'string' || (!url.startsWith('http') && !url.startsWith('ws'))) return;
+        if (typeof url !== 'string' || !/^(https?|wss?|webrtc):/.test(url)) return;
 
         const isM3U8 = /\.m3u8(\?|$)/i.test(url);
         const isTS   = /\.ts(\?|$)/i.test(url);
@@ -681,6 +765,33 @@
         _win.WebSocket.OPEN       = _OrigWebSocket.OPEN;
         _win.WebSocket.CLOSING    = _OrigWebSocket.CLOSING;
         _win.WebSocket.CLOSED     = _OrigWebSocket.CLOSED;
+    }
+
+    // Hook HTMLMediaElement.srcObject — detect WebRTC streams (RTCPeerConnection).
+    // WebRTC video is transported via SRTP/DTLS and never appears in the Network tab.
+    // When page code does `videoEl.srcObject = mediaStream`, we capture the stream.
+    const _MediaElement = _win.HTMLMediaElement;
+    if (_MediaElement && _MediaElement.prototype) {
+        const _srcObjDesc = Object.getOwnPropertyDescriptor(_MediaElement.prototype, 'srcObject');
+        if (_srcObjDesc && _srcObjDesc.set) {
+            const _origSrcObjectSet = _srcObjDesc.set;
+            Object.defineProperty(_MediaElement.prototype, 'srcObject', {
+                get: _srcObjDesc.get,
+                set(val) {
+                    try {
+                        if (val instanceof _win.MediaStream && val.getVideoTracks().length > 0) {
+                            const key = 'webrtc://' + _win.location.hostname + '/' + val.id;
+                            if (!_webrtcStreams.has(key)) {
+                                _webrtcStreams.set(key, val);
+                                addDetectedStream(key);
+                            }
+                        }
+                    } catch { /* ignore hook errors */ }
+                    return _origSrcObjectSet.call(this, val);
+                },
+                configurable: true,
+            });
+        }
     }
 
     // Scan existing <video src> / <source src> elements, including their type attributes.
@@ -919,8 +1030,8 @@
      * @param {object} dl - download record with `_isRestored` already deleted
      */
     async function resumeDownload(dl) {
-        // No directory handle, or a WebSocket stream (live — cannot be seeked/resumed).
-        if (!downloadDirHandle || dl.isWS) {
+        // No directory handle, or a live stream that cannot be seeked/resumed.
+        if (!downloadDirHandle || dl.isWS || dl.isWebRTC) {
             dl.status = 'interrupted';
             updateUI();
             _persistDownloads();
