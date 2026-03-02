@@ -361,6 +361,44 @@ async function startDL(url, mimeType) {
             else if (isWS) await dlWebSocket(url, filename, id, stopSignal, w);
             else           await dlDirect(url, filename, id, stopSignal, w);
             await patchDownload(id, { status: stopSignal.stopped ? 'stopped' : 'completed' });
+            // When the file was buffered in OPFS (no directory handle / permission),
+            // automatically push it to the user's Downloads folder so it is immediately
+            // visible without requiring a manual "💾 Save" click.
+            if (!savedToDir) {
+                try {
+                    const root  = await navigator.storage.getDirectory();
+                    const fh    = await root.getFileHandle(filename);
+                    const file  = await fh.getFile();
+                    const dlUrl = URL.createObjectURL(file);
+                    const dlId  = await new Promise((resolve, reject) => {
+                        chrome.downloads.download(
+                            { url: dlUrl, filename, conflictAction: 'uniquify' },
+                            (dlItemId) => {
+                                if (chrome.runtime.lastError) {
+                                    URL.revokeObjectURL(dlUrl);
+                                    reject(new Error(chrome.runtime.lastError.message));
+                                } else {
+                                    resolve(dlItemId);
+                                }
+                            }
+                        );
+                    });
+                    // Revoke the blob URL only after the download reaches a terminal
+                    // state — Chrome may stream the file asynchronously after the
+                    // download-created callback, so revoking early could truncate it.
+                    const onDlChanged = (delta) => {
+                        if (delta.id !== dlId || !delta.state) return;
+                        if (delta.state.current === 'complete' || delta.state.current === 'interrupted') {
+                            URL.revokeObjectURL(dlUrl);
+                            chrome.downloads.onChanged.removeListener(onDlChanged);
+                        }
+                    };
+                    chrome.downloads.onChanged.addListener(onDlChanged);
+                    await patchDownload(id, { autoSaved: true });
+                } catch (e) {
+                    console.warn('[LSR] Auto-save to Downloads folder failed:', e);
+                }
+            }
         } catch (e) {
             console.error('[LSR] Download error:', e);
             await patchDownload(id, { status: 'error: ' + e.message });

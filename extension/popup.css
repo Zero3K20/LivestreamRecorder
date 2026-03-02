@@ -147,6 +147,12 @@ body {
 }
 .save-btn:hover { background: #2471a3; }
 
+.dl-autosaved {
+    font-size: 11px;
+    color: #27ae60;
+    flex-shrink: 0;
+}
+
 .add-row {
     display: flex;
     gap: 4px;
