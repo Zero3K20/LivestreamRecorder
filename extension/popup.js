@@ -218,6 +218,19 @@ document.getElementById('detected-list').addEventListener('click', async (e) => 
     btn.textContent = '…';
     const url = btn.dataset.url;
     try {
+        // Ensure directory write permission is 'granted' before handing off to the
+        // background service worker, which cannot call requestPermission itself.
+        // This must run inside a click handler so the user-gesture requirement is met.
+        // If the user denies permission (or requestPermission throws for any reason),
+        // the download proceeds normally and falls back to OPFS.
+        if (saveDirHandleRef) {
+            try {
+                const perm = await saveDirHandleRef.queryPermission({ mode: 'readwrite' });
+                if (perm === 'prompt') {
+                    await saveDirHandleRef.requestPermission({ mode: 'readwrite' });
+                }
+            } catch { /* permission denied or unavailable — background will fall back to OPFS */ }
+        }
         await send({ type: 'startDownload', url });
         await renderDownloads();
     } catch (err) {
