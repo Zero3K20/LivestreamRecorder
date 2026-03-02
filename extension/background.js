@@ -1,6 +1,7 @@
 // background.js — Livestream Recorder service worker
-// Handles state (chrome.storage.local), cross-origin fetch, and downloads
-// written to the Origin Private File System (OPFS) so they survive page navigation.
+// Handles state (chrome.storage.local), cross-origin fetch, and downloads.
+// Downloads are written directly to the user's chosen directory when the handle
+// is available and permitted; otherwise buffered to OPFS as a fallback.
 'use strict';
 
 // ─── Storage keys ────────────────────────────────────────────────────────────
@@ -102,9 +103,8 @@ async function patchDownload(id, patch) {
 }
 
 // ─── OPFS helpers ─────────────────────────────────────────────────────────────
-// The Origin Private File System is accessible from service workers and shared
-// with the extension's popup page, allowing the popup to read completed files
-// and offer them via showSaveFilePicker / a pre-selected directory.
+// Used as a fallback when no directory handle is available or its permission
+// has not been granted.
 
 async function opfsGetWritable(filename, keepExisting = false, seekOffset = 0) {
     const root = await navigator.storage.getDirectory();
@@ -121,10 +121,59 @@ async function opfsDelete(filename) {
     } catch { /* already gone */ }
 }
 
+// ─── IDB helpers for directory handle ────────────────────────────────────────
+// The popup stores the user-selected FileSystemDirectoryHandle in IndexedDB.
+// The service worker shares the same extension origin so it can read that handle
+// and write downloads directly to the user's directory when permission is granted.
+
+const IDB_NAME    = 'lsr-popup-db';
+const IDB_VERSION = 1;
+const IDB_STORE   = 'handles';
+
+function idbOpen() {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+        req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+        req.onsuccess  = () => resolve(req.result);
+        req.onerror    = () => reject(req.error);
+    });
+}
+
+async function idbLoadDirHandle() {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+        const tx  = db.transaction(IDB_STORE, 'readonly');
+        const req = tx.objectStore(IDB_STORE).get('directory');
+        req.onsuccess = () => resolve(req.result ?? null);
+        req.onerror   = () => reject(req.error);
+    });
+}
+
+/**
+ * Get a writable stream for `filename`.
+ * Writes directly to the user's chosen directory if the handle is available and
+ * permission is already 'granted'.  Falls back to OPFS otherwise.
+ *
+ * @param {string} filename
+ * @returns {Promise<{ writable: FileSystemWritableFileStream, savedToDir: boolean }>}
+ */
+async function getWritable(filename) {
+    try {
+        const dirHandle = await idbLoadDirHandle();
+        if (dirHandle) {
+            const perm = await dirHandle.queryPermission({ mode: 'readwrite' });
+            if (perm === 'granted') {
+                const fh = await dirHandle.getFileHandle(filename, { create: true });
+                return { writable: await fh.createWritable(), savedToDir: true };
+            }
+        }
+    } catch { /* fall through to OPFS */ }
+    return { writable: await opfsGetWritable(filename), savedToDir: false };
+}
+
 // ─── HLS downloader ───────────────────────────────────────────────────────────
 
-async function dlHLS(url, filename, id, stopSignal) {
-    const writable = await opfsGetWritable(filename);
+async function dlHLS(url, filename, id, stopSignal, writable) {
     let lastSeq = -1, targetDuration = 5, consecutiveErrors = 0, bytesWritten = 0;
     try {
         // Resolve master playlist → best-quality media playlist URL.
@@ -177,8 +226,7 @@ async function dlHLS(url, filename, id, stopSignal) {
 
 // ─── Direct HTTP downloader ───────────────────────────────────────────────────
 
-async function dlDirect(url, filename, id, stopSignal) {
-    const writable = await opfsGetWritable(filename);
+async function dlDirect(url, filename, id, stopSignal, writable) {
     let bytesWritten = 0;
     try {
         let totalSize = null, supportsRange = false;
@@ -221,8 +269,7 @@ async function dlDirect(url, filename, id, stopSignal) {
 // The background service worker can open WebSocket connections, so binary live
 // streams continue even after the originating page is closed.
 
-async function dlWebSocket(url, filename, id, stopSignal) {
-    const writable = await opfsGetWritable(filename);
+async function dlWebSocket(url, filename, id, stopSignal, writable) {
     let bytesWritten = 0;
     try {
         await new Promise((resolve, reject) => {
@@ -300,15 +347,27 @@ async function startDL(url, mimeType) {
 
     // Start the download asynchronously — it outlives the message handler.
     (async () => {
+        let writable = null;
         try {
-            if (isHLS)     await dlHLS(url, filename, id, stopSignal);
-            else if (isWS) await dlWebSocket(url, filename, id, stopSignal);
-            else           await dlDirect(url, filename, id, stopSignal);
+            let savedToDir = false;
+            ({ writable, savedToDir } = await getWritable(filename));
+            await patchDownload(id, { savedToDir });
+            // Hand the writable to the downloader, which always closes it in its own
+            // finally block.  Null-out our reference first so the outer finally below
+            // does not attempt a second close (which would throw).
+            const w = writable;
+            writable = null;
+            if (isHLS)     await dlHLS(url, filename, id, stopSignal, w);
+            else if (isWS) await dlWebSocket(url, filename, id, stopSignal, w);
+            else           await dlDirect(url, filename, id, stopSignal, w);
             await patchDownload(id, { status: stopSignal.stopped ? 'stopped' : 'completed' });
         } catch (e) {
             console.error('[LSR] Download error:', e);
             await patchDownload(id, { status: 'error: ' + e.message });
         } finally {
+            // Close the writable only if it was never handed to a downloader
+            // (e.g. getWritable succeeded but patchDownload threw before the hand-off).
+            if (writable) try { await writable.close(); } catch { /* best-effort */ }
             activeOps.delete(id);
         }
     })();

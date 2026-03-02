@@ -197,7 +197,7 @@ async function renderDownloads() {
             `  <span class="dl-size">${formatBytes(dl.bytesWritten)}</span>` +
             `  <span class="dl-status status-${escapeHTML(statusKey)}">${escapeHTML(dl.status)}</span>` +
             (isActive ? `<button class="stop-btn" data-id="${dl.id}">■ Stop</button>` : '') +
-            (isDone   ? `<button class="save-btn" data-filename="${escapeHTML(dl.filename)}">💾 Save</button>` : '') +
+            (isDone && !dl.savedToDir ? `<button class="save-btn" data-filename="${escapeHTML(dl.filename)}">💾 Save</button>` : '') +
             `</div>`;
         el.appendChild(item);
     }
