@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.4
+// @version      1.4.5
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -912,6 +912,30 @@
         await _idbPut('detectedM3U8Prefixes', [...detectedM3U8Prefixes]);
     }
 
+    /**
+     * Synchronously commit the current download state to GM_setValue storage.
+     * Safe to call from a `beforeunload` handler because GM_setValue is
+     * synchronous in Tampermonkey/Violentmonkey and does not require an async
+     * context.  The IDB write is inherently async and may not complete before
+     * the page is torn down, so this backup is the only reliable flush on unload.
+     */
+    function _persistDownloadsSync() {
+        const snapshot = [...activeDownloads.values()].map((dl) => ({
+            id:           dl.id,
+            url:          dl.url,
+            filename:     dl.filename,
+            isHLS:        dl.isHLS,
+            isWS:         dl.isWS,
+            isWebRTC:     dl.isWebRTC,
+            status:       dl.status,
+            bytesWritten: dl.bytesWritten,
+        }));
+        try {
+            GM_setValue(DOWNLOADS_GM_KEY, JSON.stringify(snapshot));
+            GM_setValue(NEXT_ID_GM_KEY,   String(nextId));
+        } catch (e) { console.warn('[LivestreamRecorder] GM_setValue flush failed:', e); }
+    }
+
     /** Persist the download-history state to IDB (debounced on progress; immediate on finals). */
     async function _persistDownloads() {
         const snapshot = [...activeDownloads.values()].map((dl) => ({
@@ -920,13 +944,11 @@
             filename:     dl.filename,
             isHLS:        dl.isHLS,
             isWS:         dl.isWS,
+            isWebRTC:     dl.isWebRTC,
             status:       dl.status,
             bytesWritten: dl.bytesWritten,
         }));
-        // Write the backup via GM_setValue BEFORE the async IDB write.
-        // GM_setValue is synchronous in Tampermonkey and works correctly in
-        // all sandbox modes (unlike localStorage, which is isolated from the
-        // page's storage when any @grant value is declared).
+        // Sync backup first (completes before async IDB, which may not finish on unload).
         try {
             GM_setValue(DOWNLOADS_GM_KEY, JSON.stringify(snapshot));
             GM_setValue(NEXT_ID_GM_KEY,   String(nextId));
@@ -987,6 +1009,7 @@
                         filename:     saved.filename,
                         isHLS:        saved.isHLS,
                         isWS:         saved.isWS,
+                        isWebRTC:     saved.isWebRTC,
                         status:       saved.status,
                         bytesWritten: saved.bytesWritten,
                         stopSignal:   { stopped: true },
@@ -1002,6 +1025,7 @@
                         filename:     saved.filename,
                         isHLS:        saved.isHLS,
                         isWS:         saved.isWS,
+                        isWebRTC:     saved.isWebRTC,
                         status:       'downloading',
                         bytesWritten: saved.bytesWritten,
                         stopSignal,
@@ -1383,6 +1407,25 @@
                 _applyDirectoryHandle(e.data.handle);
             }
         };
+
+        // Warn before navigating away while resumable (HLS/HTTP) downloads are active,
+        // and do a synchronous GM_setValue flush so the resume point is up-to-date.
+        // WebSocket and WebRTC downloads cannot survive page navigation (the live source
+        // is destroyed), so they do not block the unload or show a warning.
+        window.addEventListener('beforeunload', (e) => {
+            if (activeDownloads.size === 0) return;
+            const hasResumable = [...activeDownloads.values()].some(
+                (dl) => dl.status === 'downloading' && !dl.isWS && !dl.isWebRTC,
+            );
+            _persistDownloadsSync();
+            if (hasResumable) {
+                // Modern browsers ignore the return value text and show their own generic
+                // "Leave site?" prompt, but setting returnValue is still required to
+                // trigger the dialog across all supported browsers.
+                e.preventDefault();
+                e.returnValue = '';
+            }
+        });
 
         // Restore all persisted state (streams, downloads, directory handle) from IDB,
         // then resume any downloads that were active when the tab was last unloaded.
