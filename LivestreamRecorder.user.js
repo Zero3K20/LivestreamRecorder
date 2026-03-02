@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.1
+// @version      1.4.2
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -9,6 +9,7 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        unsafeWindow
 // @connect      *
 // @run-at       document-start
 // ==/UserScript==
@@ -26,6 +27,13 @@
 
     /** WebSocket URL patterns that indicate a binary media stream. */
     const WS_STREAM_RE = /\.(flv|ts|m4s|mp4|aac)(\?|$)/i;
+
+    // When @grant directives are present, some userscript managers (Violentmonkey,
+    // Greasemonkey on Firefox) run the script in a sandboxed context where `window`
+    // is a proxy wrapper.  Replacing window.fetch or window.WebSocket on that proxy
+    // only affects the sandbox — the real page code still calls the originals.
+    // `unsafeWindow` is the real page window and must be used for all API hooks.
+    const _win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
     // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -75,7 +83,7 @@
     const NEXT_ID_GM_KEY    = '__LSR_nextId_'    + TAB_ID + '__';
 
     /** Original WebSocket constructor saved before hooking, used by downloadWebSocket. */
-    const _OrigWebSocket = (typeof window.WebSocket !== 'undefined') ? window.WebSocket : null;
+    const _OrigWebSocket = (typeof _win.WebSocket !== 'undefined') ? _win.WebSocket : null;
 
     let nextId = 1;
 
@@ -568,8 +576,8 @@
     }
 
     // Hook XMLHttpRequest — URL-pattern check on open(); MIME-type check on send().
-    const _xhrOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    const _xhrOpen = _win.XMLHttpRequest.prototype.open;
+    _win.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
         try {
             const full = resolveURL(location.href, String(url));
             this._lsrUrl = full;
@@ -578,8 +586,8 @@
         return _xhrOpen.call(this, method, url, ...rest);
     };
 
-    const _xhrSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.send = function (...args) {
+    const _xhrSend = _win.XMLHttpRequest.prototype.send;
+    _win.XMLHttpRequest.prototype.send = function (...args) {
         const lsrUrl = this._lsrUrl;
         if (lsrUrl) {
             // Use a named handler so it can remove itself after firing once.
@@ -599,8 +607,8 @@
 
     // Hook fetch — URL-pattern check immediately; MIME-type check on response (only
     // when the URL didn't already match, to avoid overhead on every non-stream fetch).
-    const _fetch = window.fetch;
-    window.fetch = function (input, ...rest) {
+    const _fetch = _win.fetch;
+    _win.fetch = function (input, ...rest) {
         let full;
         try {
             const url = typeof input === 'string' ? input : (input && input.url) || '';
@@ -626,7 +634,7 @@
 
     // Hook WebSocket — capture ws:// and wss:// stream connections.
     if (_OrigWebSocket) {
-        window.WebSocket = function (url, protocols) {
+        _win.WebSocket = function (url, protocols) {
             const strUrl = String(url || '');
             const ws = protocols !== undefined
                 ? new _OrigWebSocket(url, protocols)
@@ -651,11 +659,11 @@
             } catch { /* ignore hook errors */ }
             return ws;
         };
-        window.WebSocket.prototype = _OrigWebSocket.prototype;
-        window.WebSocket.CONNECTING = _OrigWebSocket.CONNECTING;
-        window.WebSocket.OPEN       = _OrigWebSocket.OPEN;
-        window.WebSocket.CLOSING    = _OrigWebSocket.CLOSING;
-        window.WebSocket.CLOSED     = _OrigWebSocket.CLOSED;
+        _win.WebSocket.prototype = _OrigWebSocket.prototype;
+        _win.WebSocket.CONNECTING = _OrigWebSocket.CONNECTING;
+        _win.WebSocket.OPEN       = _OrigWebSocket.OPEN;
+        _win.WebSocket.CLOSING    = _OrigWebSocket.CLOSING;
+        _win.WebSocket.CLOSED     = _OrigWebSocket.CLOSED;
     }
 
     // Scan existing <video src> / <source src> elements, including their type attributes.
