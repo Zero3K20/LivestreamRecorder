@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.2
+// @version      1.4.3
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -27,6 +27,12 @@
 
     /** WebSocket URL patterns that indicate a binary media stream. */
     const WS_STREAM_RE = /\.(flv|ts|m4s|mp4|aac)(\?|$)/i;
+
+    /** Number of binary WebSocket frames required to declare a stream (avoids one-shot control frames). */
+    const WS_BINARY_DETECT_COUNT = 2;
+
+    /** Stop watching a WebSocket for binary frames after this many total messages with no detection. */
+    const WS_BINARY_GIVE_UP_COUNT = 50;
 
     // When @grant directives are present, some userscript managers (Violentmonkey,
     // Greasemonkey on Firefox) run the script in a sandboxed context where `window`
@@ -643,15 +649,26 @@
                 if (isWebSocketStreamURL(strUrl)) {
                     addDetectedStream(strUrl);
                 } else {
-                    // Watch for large binary messages which indicate a media stream.
-                    let detected = false;
+                    // Watch for binary messages (ArrayBuffer or Blob of any size).
+                    // Media streams always produce binary frames; chat/signalling
+                    // WebSockets (e.g. Pusher) use only JSON text frames.
+                    // Require WS_BINARY_DETECT_COUNT binary messages to avoid false-positives
+                    // from one-shot binary control frames.  Give up after WS_BINARY_GIVE_UP_COUNT
+                    // total messages to avoid leaking listeners on non-media sockets.
+                    let binaryCount = 0;
+                    let totalCount = 0;
                     const binaryDetector = function (e) {
-                        if (detected) return;
-                        if ((e.data instanceof ArrayBuffer && e.data.byteLength > 1024) ||
-                            (e.data instanceof Blob && e.data.size > 1024)) {
-                            detected = true;
+                        totalCount++;
+                        if (e.data instanceof ArrayBuffer || e.data instanceof Blob) {
+                            if (++binaryCount >= WS_BINARY_DETECT_COUNT) {
+                                ws.removeEventListener('message', binaryDetector);
+                                addDetectedStream(strUrl);
+                                return;
+                            }
+                        }
+                        if (totalCount >= WS_BINARY_GIVE_UP_COUNT) {
+                            // Too many messages without reaching the binary threshold.
                             ws.removeEventListener('message', binaryDetector);
-                            addDetectedStream(strUrl);
                         }
                     };
                     ws.addEventListener('message', binaryDetector);
