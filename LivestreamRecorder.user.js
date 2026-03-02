@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.3.9
-// @description  Record and download m3u8/flv/mp4/etc. live streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
+// @version      1.4.0
+// @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -23,6 +23,9 @@
 
     /** Content-Type values that identify a live stream regardless of URL extension. */
     const STREAM_MIME_RE = /video\/x-flv|video\/mp2t|application\/(x-mpegurl|vnd\.apple\.mpegurl)/i;
+
+    /** WebSocket URL patterns that indicate a binary media stream. */
+    const WS_STREAM_RE = /\.(flv|ts|m4s|mp4|aac)(\?|$)/i;
 
     // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -70,6 +73,9 @@
     const NEXT_ID_IDB_KEY   = 'nextId_'    + TAB_ID;
     const DOWNLOADS_GM_KEY  = '__LSR_downloads_' + TAB_ID + '__';
     const NEXT_ID_GM_KEY    = '__LSR_nextId_'    + TAB_ID + '__';
+
+    /** Original WebSocket constructor saved before hooking, used by downloadWebSocket. */
+    const _OrigWebSocket = (typeof window.WebSocket !== 'undefined') ? window.WebSocket : null;
 
     let nextId = 1;
 
@@ -354,6 +360,62 @@
         }
     }
 
+    // ─── WebSocket stream downloader ──────────────────────────────────────────────
+
+    /**
+     * Record a WebSocket-based binary stream by opening a new connection and writing
+     * all received binary frames to disk as they arrive.  Text frames are ignored.
+     * Cannot be resumed after disconnection because the stream is live.
+     *
+     * @param {string} url - ws:// or wss:// URL
+     * @param {FileSystemFileHandle} fileHandle
+     * @param {function(number): void} onProgress
+     * @param {{ stopped: boolean }} stopSignal
+     */
+    async function downloadWebSocket(url, fileHandle, onProgress, stopSignal) {
+        if (!_OrigWebSocket) throw new Error('WebSocket is not available in this environment');
+        const writable = await fileHandle.createWritable({ keepExistingData: false });
+        try {
+            await new Promise((resolve, reject) => {
+                const ws = new _OrigWebSocket(url);
+                ws.binaryType = 'arraybuffer';
+                let stopCheckTimer = null;
+
+                const cleanup = () => {
+                    if (stopCheckTimer !== null) { clearInterval(stopCheckTimer); stopCheckTimer = null; }
+                };
+
+                ws.onmessage = async (e) => {
+                    if (stopSignal.stopped) { ws.close(); return; }
+                    if (!(e.data instanceof ArrayBuffer) || e.data.byteLength === 0) return;
+                    try {
+                        await writable.write(e.data);
+                        onProgress(e.data.byteLength);
+                    } catch (writeErr) {
+                        cleanup();
+                        ws.close();
+                        reject(writeErr);
+                    }
+                };
+
+                ws.onerror = () => { cleanup(); reject(new Error('WebSocket connection failed')); };
+                ws.onclose = (e) => {
+                    cleanup();
+                    if (stopSignal.stopped || e.wasClean) resolve();
+                    else reject(new Error(`WebSocket closed unexpectedly (code ${e.code})`));
+                };
+
+                // Poll the stop signal so the connection is closed promptly when
+                // the user clicks Stop.
+                stopCheckTimer = setInterval(() => {
+                    if (stopSignal.stopped) ws.close();
+                }, 250);
+            });
+        } finally {
+            await writable.close();
+        }
+    }
+
     // ─── Start / stop downloads ───────────────────────────────────────────────────
 
     /** Creates the standard progress callback used by both startDownload and resumeDownload. */
@@ -390,10 +452,17 @@
 
         const id = nextId++;
         const mime = streamMimeTypes.get(url) || '';
-        const isHLS = /\.m3u8(\?|$)/i.test(url) || /[?&].*m3u8/i.test(url) ||
-                      /application\/(x-mpegurl|vnd\.apple\.mpegurl)/i.test(mime);
-        let ext = 'ts';
-        if (!isHLS) {
+        const isWS  = /^wss?:\/\//i.test(url);
+        const isHLS = !isWS && (/\.m3u8(\?|$)/i.test(url) || /[?&].*m3u8/i.test(url) ||
+                      /application\/(x-mpegurl|vnd\.apple\.mpegurl)/i.test(mime));
+        let ext = isHLS ? 'ts' : 'mp4';
+        if (isWS) {
+            try {
+                const pathname = new URL(url).pathname;
+                const raw = pathname.split('.').pop().split('?')[0].toLowerCase();
+                ext = /^[a-z0-9]{2,5}$/.test(raw) ? raw : 'bin';
+            } catch { ext = 'bin'; }
+        } else if (!isHLS) {
             if (/video\/x-flv/i.test(mime)) {
                 ext = 'flv';
             } else {
@@ -413,6 +482,7 @@
             url,
             filename,
             isHLS,
+            isWS,
             status: 'downloading',
             bytesWritten: 0,
             stopSignal,
@@ -434,6 +504,8 @@
 
             if (isHLS) {
                 await downloadHLS(url, fileHandle, onProgress, stopSignal);
+            } else if (isWS) {
+                await downloadWebSocket(url, fileHandle, onProgress, stopSignal);
             } else {
                 await downloadDirect(url, fileHandle, onProgress, stopSignal);
             }
@@ -456,6 +528,12 @@
         return typeof url === 'string' && STREAM_RE.test(url);
     }
 
+    /** Returns true for ws:// / wss:// URLs that look like binary media streams. */
+    function isWebSocketStreamURL(url) {
+        if (typeof url !== 'string' || !/^wss?:\/\//i.test(url)) return false;
+        return WS_STREAM_RE.test(url) || /\/(live|stream|push|play|video)\//i.test(url);
+    }
+
     /**
      * Add a stream URL to the detected list.
      * Suppresses individual .ts segments when the parent .m3u8 playlist has already
@@ -464,7 +542,7 @@
      * @param {string} [mimeType]
      */
     function addDetectedStream(url, mimeType) {
-        if (typeof url !== 'string' || !url.startsWith('http')) return;
+        if (typeof url !== 'string' || (!url.startsWith('http') && !url.startsWith('ws'))) return;
 
         const isM3U8 = /\.m3u8(\?|$)/i.test(url);
         const isTS   = /\.ts(\?|$)/i.test(url);
@@ -545,6 +623,40 @@
         }
         return _fetch.call(this, input, ...rest);
     };
+
+    // Hook WebSocket — capture ws:// and wss:// stream connections.
+    if (_OrigWebSocket) {
+        window.WebSocket = function (url, protocols) {
+            const strUrl = String(url || '');
+            const ws = protocols !== undefined
+                ? new _OrigWebSocket(url, protocols)
+                : new _OrigWebSocket(url);
+            try {
+                if (isWebSocketStreamURL(strUrl)) {
+                    addDetectedStream(strUrl);
+                } else {
+                    // Watch for large binary messages which indicate a media stream.
+                    let detected = false;
+                    const binaryDetector = function (e) {
+                        if (detected) return;
+                        if ((e.data instanceof ArrayBuffer && e.data.byteLength > 1024) ||
+                            (e.data instanceof Blob && e.data.size > 1024)) {
+                            detected = true;
+                            ws.removeEventListener('message', binaryDetector);
+                            addDetectedStream(strUrl);
+                        }
+                    };
+                    ws.addEventListener('message', binaryDetector);
+                }
+            } catch { /* ignore hook errors */ }
+            return ws;
+        };
+        window.WebSocket.prototype = _OrigWebSocket.prototype;
+        window.WebSocket.CONNECTING = _OrigWebSocket.CONNECTING;
+        window.WebSocket.OPEN       = _OrigWebSocket.OPEN;
+        window.WebSocket.CLOSING    = _OrigWebSocket.CLOSING;
+        window.WebSocket.CLOSED     = _OrigWebSocket.CLOSED;
+    }
 
     // Scan existing <video src> / <source src> elements, including their type attributes.
     function scanPageElements() {
@@ -671,6 +783,7 @@
             url:          dl.url,
             filename:     dl.filename,
             isHLS:        dl.isHLS,
+            isWS:         dl.isWS,
             status:       dl.status,
             bytesWritten: dl.bytesWritten,
         }));
@@ -737,6 +850,7 @@
                         url:          saved.url,
                         filename:     saved.filename,
                         isHLS:        saved.isHLS,
+                        isWS:         saved.isWS,
                         status:       saved.status,
                         bytesWritten: saved.bytesWritten,
                         stopSignal:   { stopped: true },
@@ -751,6 +865,7 @@
                         url:          saved.url,
                         filename:     saved.filename,
                         isHLS:        saved.isHLS,
+                        isWS:         saved.isWS,
                         status:       'downloading',
                         bytesWritten: saved.bytesWritten,
                         stopSignal,
@@ -779,7 +894,8 @@
      * @param {object} dl - download record with `_isRestored` already deleted
      */
     async function resumeDownload(dl) {
-        if (!downloadDirHandle) {
+        // No directory handle, or a WebSocket stream (live — cannot be seeked/resumed).
+        if (!downloadDirHandle || dl.isWS) {
             dl.status = 'interrupted';
             updateUI();
             _persistDownloads();
