@@ -299,6 +299,14 @@ chrome.storage.onChanged.addListener((changes, area) => {
     if (S_SAVE_DIR in changes) {
         const name = changes[S_SAVE_DIR].newValue;
         document.getElementById('dir-name').textContent = name || 'No directory selected — files saved via Save dialog';
+        // Reload the live handle from IDB so saveFile() writes to the newly chosen directory.
+        if (name) {
+            loadDirHandle().then((h) => { if (h) saveDirHandleRef = h; }).catch((err) => {
+                console.warn('[LSR] Could not reload directory handle from IDB:', err);
+            });
+        } else {
+            saveDirHandleRef = null;
+        }
     }
 });
 

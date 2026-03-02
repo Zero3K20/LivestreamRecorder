@@ -10,6 +10,8 @@
     const STREAM_MIME_RE = /video\/x-flv|video\/mp2t|application\/(x-mpegurl|vnd\.apple\.mpegurl)/i;
     const WS_STREAM_RE   = /\.(flv|ts|m4s|mp4|aac)(\?|$)/i;
     const STREAM_RE      = /\.(m3u8|flv|mpd|ts)(\?|$)/i;
+    const M3U8_URL_RE    = /\.m3u8(\?|#|$)/i;
+    const TS_URL_RE      = /\.ts(\?|#|$)/i;
 
     /** Consecutive binary frames required before classifying a WebSocket as a media stream. */
     const WS_BINARY_DETECT_COUNT  = 2;
@@ -33,12 +35,22 @@
     }
 
     /**
+     * True once a .m3u8 playlist URL has been detected on this page.
+     * Used to suppress individual .ts segment URLs that an HLS player fetches
+     * after the playlist — we only need the playlist URL, not every segment.
+     */
+    let m3u8Detected = false;
+
+    /**
      * Send a detected stream URL to the ISOLATED world content script.
      * Using window.postMessage is the only way for MAIN-world scripts to reach
      * the extension's ISOLATED world without DOM mutation hacks.
      */
     function send(url, mimeType) {
         if (!url || typeof url !== 'string') return;
+        // Once a .m3u8 playlist has been seen, suppress individual .ts segments.
+        if (m3u8Detected && TS_URL_RE.test(url)) return;
+        if (M3U8_URL_RE.test(url)) m3u8Detected = true;
         window.postMessage({ __lsr: true, type: 'stream', url, mimeType: mimeType || null }, '*');
     }
 

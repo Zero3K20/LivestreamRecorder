@@ -44,15 +44,16 @@ btn.addEventListener('click', async () => {
     try {
         const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
 
-        // Persist the directory name as a plain string — always reliable.
-        await chrome.storage.local.set({ [S_SAVE_DIR]: handle.name });
-
-        // Best-effort: cache the live handle in IDB for same-session direct writes.
+        // Cache the live handle in IDB first so that when chrome.storage fires
+        // the onChanged event in the popup, the handle is already available.
         try {
             await saveDirHandleToIDB(handle);
         } catch (idbErr) {
             console.warn('[LSR] Could not cache directory handle in IDB:', idbErr);
         }
+
+        // Persist the directory name as a plain string — always reliable.
+        await chrome.storage.local.set({ [S_SAVE_DIR]: handle.name });
 
         msg.textContent = '✓ Saved: ' + handle.name;
         // Give the user a moment to see the confirmation, then close.
