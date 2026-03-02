@@ -327,6 +327,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
             const streams = data[S_STREAMS] || [];
             const mimes   = data[S_MIMES]   || {};
             if (!streams.includes(msg.url)) {
+                // Suppress .ts segment URLs once a .m3u8 playlist is already in the list.
+                // HLS players fetch every segment individually; we only want the playlist.
+                const hasM3U8    = streams.some((u) => /\.m3u8(\?|$)/i.test(u));
+                const isTSSegment = /\.ts(\?|#|$)/i.test(msg.url);
+                if (hasM3U8 && isTSSegment) { respond({ ok: true }); return; }
+
                 streams.push(msg.url);
                 if (msg.mimeType) mimes[msg.url] = msg.mimeType;
                 await chrome.storage.local.set({ [S_STREAMS]: streams, [S_MIMES]: mimes });
