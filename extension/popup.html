@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Livestream Recorder</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div id="header">
+    <span id="header-title">🎥 Livestream Recorder</span>
+  </div>
+
+  <div id="body">
+
+    <div class="section">
+      <div class="label">Save Directory</div>
+      <button class="btn" id="btn-select-dir">📂 Select Directory…</button>
+      <div class="dir-name" id="dir-name">No directory selected — files saved via Save dialog</div>
+    </div>
+
+    <div class="section">
+      <div class="label">
+        Detected Streams
+        <button class="clear-btn" id="btn-clear-streams">Clear</button>
+      </div>
+      <div id="detected-list"></div>
+      <div class="add-row">
+        <input class="url-input" id="manual-url" type="text" placeholder="Or paste a stream URL…">
+        <button class="add-btn" id="btn-add-url">Add</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="label">
+        Downloads
+        <button class="clear-btn" id="btn-clear-downloads">Clear finished</button>
+      </div>
+      <div id="downloads-list"></div>
+    </div>
+
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
