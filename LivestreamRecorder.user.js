@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.7
+// @version      1.4.8
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -1004,43 +1004,33 @@
         if (Array.isArray(downloads)) {
             downloads.forEach((saved) => {
                 if (saved.status !== 'downloading') {
-                    // Terminal entries (completed, stopped, error, interrupted) — display as-is.
-                    activeDownloads.set(saved.id, {
-                        id:           saved.id,
-                        url:          saved.url,
-                        filename:     saved.filename,
-                        isHLS:        saved.isHLS,
-                        isWS:         saved.isWS,
-                        isWebRTC:     saved.isWebRTC,
-                        status:       saved.status,
-                        bytesWritten: saved.bytesWritten,
-                        stopSignal:   { stopped: true },
-                        // stop() is a no-op on terminal entries; stub satisfies the updateUI interface.
-                        stop()        {},
-                    });
-                } else {
-                    // In-flight downloads will be auto-resumed after the directory handle is loaded.
-                    const stopSignal = { stopped: false };
-                    const dl = {
-                        id:           saved.id,
-                        url:          saved.url,
-                        filename:     saved.filename,
-                        isHLS:        saved.isHLS,
-                        isWS:         saved.isWS,
-                        isWebRTC:     saved.isWebRTC,
-                        status:       'downloading',
-                        bytesWritten: saved.bytesWritten,
-                        stopSignal,
-                        _isRestored:  true,
-                        stop() {
-                            stopSignal.stopped = true;
-                            dl.status = 'stopped';
-                            updateUI();
-                            _persistDownloads();
-                        },
-                    };
-                    activeDownloads.set(saved.id, dl);
+                    // Terminal entries (completed, stopped, error, interrupted) are
+                    // session-only display state and are intentionally not restored
+                    // across page refreshes, so that a user Clear action is never
+                    // undone by a reload.
+                    return;
                 }
+                // In-flight downloads will be auto-resumed after the directory handle is loaded.
+                const stopSignal = { stopped: false };
+                const dl = {
+                    id:           saved.id,
+                    url:          saved.url,
+                    filename:     saved.filename,
+                    isHLS:        saved.isHLS,
+                    isWS:         saved.isWS,
+                    isWebRTC:     saved.isWebRTC,
+                    status:       'downloading',
+                    bytesWritten: saved.bytesWritten,
+                    stopSignal,
+                    _isRestored:  true,
+                    stop() {
+                        stopSignal.stopped = true;
+                        dl.status = 'stopped';
+                        updateUI();
+                        _persistDownloads();
+                    },
+                };
+                activeDownloads.set(saved.id, dl);
             });
         }
 
@@ -1414,11 +1404,13 @@
         // WebSocket and WebRTC downloads cannot survive page navigation (the live source
         // is destroyed), so they do not block the unload or show a warning.
         window.addEventListener('beforeunload', (e) => {
+            // Always flush the current (possibly cleared) download state so that a
+            // user-initiated clear is never rolled back by the page reload.
+            _persistDownloadsSync();
             if (activeDownloads.size === 0) return;
             const hasResumable = [...activeDownloads.values()].some(
                 (dl) => dl.status === 'downloading' && !dl.isWS && !dl.isWebRTC,
             );
-            _persistDownloadsSync();
             if (hasResumable) {
                 // Modern browsers ignore the return value text and show their own generic
                 // "Leave site?" prompt, but setting returnValue is still required to
