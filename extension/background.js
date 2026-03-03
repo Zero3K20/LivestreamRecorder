@@ -14,6 +14,13 @@ const S_NEXT_ID = 'lsr_nextId';    // number
 /** Monotonically increasing download ID; re-synced from storage on each startDL. */
 let nextId = 1;
 
+// ─── Offscreen retry constants ────────────────────────────────────────────────
+
+/** How many times to retry forwarding a message to the offscreen document. */
+const MAX_OFFSCREEN_MESSAGE_RETRIES = 5;
+/** Milliseconds to wait between retries when offscreen is not yet ready. */
+const OFFSCREEN_MESSAGE_RETRY_DELAY_MS = 100;
+
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 function sanitizeFilename(name) {
@@ -67,16 +74,19 @@ async function opfsDelete(filename) {
 const OFFSCREEN_URL = chrome.runtime.getURL('offscreen.html');
 
 async function ensureOffscreen() {
-    const existing = await chrome.runtime.getContexts({
-        contextTypes:  [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
-        documentUrls:  [OFFSCREEN_URL],
-    });
-    if (existing.length === 0) {
+    // Avoid chrome.runtime.getContexts (Chrome 116+); use try/catch so this
+    // works on Chrome 109+ where chrome.offscreen was first available.
+    try {
         await chrome.offscreen.createDocument({
             url:           OFFSCREEN_URL,
-            reasons:       [chrome.offscreen.Reason.BLOBS],
+            reasons:       [chrome.offscreen.Reason.DOM_SCRAPING],
             justification: 'Run download engine with FileSystem Access API',
         });
+    } catch (e) {
+        // Chrome throws when a document already exists — that's fine.
+        // Match both current and any future variations of the error robustly.
+        if (e instanceof Error && /single offscreen/i.test(e.message)) return;
+        throw e;
     }
 }
 
@@ -121,11 +131,22 @@ async function startDL(url, mimeType) {
     // Ensure the offscreen document exists, then delegate the actual download to it.
     // The offscreen doc sends patchDownload / autoSave messages back as it progresses.
     await ensureOffscreen();
-    chrome.runtime.sendMessage({ target: 'offscreen', type: 'startDownload', id, url, filename, isHLS, isWS })
-        .catch((e) => {
-            console.error('[LSR] Could not forward startDownload to offscreen:', e);
-            patchDownload(id, { status: 'error: offscreen unavailable' });
-        });
+    // Retry forwarding: createDocument resolves when the document exists, but
+    // offscreen.js may not have registered its onMessage listener yet.
+    // Retry a few times with a short delay to bridge that gap.
+    let forwarded = false;
+    for (let attempt = 0; attempt < MAX_OFFSCREEN_MESSAGE_RETRIES && !forwarded; attempt++) {
+        try {
+            await chrome.runtime.sendMessage({ target: 'offscreen', type: 'startDownload', id, url, filename, isHLS, isWS });
+            forwarded = true;
+        } catch {
+            await new Promise((r) => setTimeout(r, OFFSCREEN_MESSAGE_RETRY_DELAY_MS));
+        }
+    }
+    if (!forwarded) {
+        console.error('[LSR] Could not forward startDownload to offscreen after retries');
+        patchDownload(id, { status: 'error: offscreen unavailable' });
+    }
 
     return { id, filename };
 }
