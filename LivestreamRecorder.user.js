@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.9
+// @version      1.4.10
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -89,10 +89,10 @@
         return id;
     })();
 
-    /** GM storage keys for detected streams (global — shared across all pages). */
-    const STREAMS_GM_KEY   = '__LSR_streams__';
-    const MIMES_GM_KEY     = '__LSR_mimes__';
-    const M3U8_PFX_GM_KEY  = '__LSR_m3u8pfx__';
+    /** GM storage keys for detected streams scoped to this tab so stream lists don't leak across tabs. */
+    const STREAMS_GM_KEY   = '__LSR_streams_'   + TAB_ID + '__';
+    const MIMES_GM_KEY     = '__LSR_mimes_'     + TAB_ID + '__';
+    const M3U8_PFX_GM_KEY  = '__LSR_m3u8pfx_'  + TAB_ID + '__';
 
     /** GM storage keys for downloads scoped to this tab so downloads don't leak across tabs. */
     const DOWNLOADS_GM_KEY  = '__LSR_downloads_' + TAB_ID + '__';
