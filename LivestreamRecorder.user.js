@@ -89,9 +89,12 @@
         return id;
     })();
 
-    /** IDB and GM storage keys scoped to this tab so downloads don't leak across tabs. */
-    const DOWNLOADS_IDB_KEY = 'downloads_' + TAB_ID;
-    const NEXT_ID_IDB_KEY   = 'nextId_'    + TAB_ID;
+    /** GM storage keys for detected streams (global — shared across all pages). */
+    const STREAMS_GM_KEY   = '__LSR_streams__';
+    const MIMES_GM_KEY     = '__LSR_mimes__';
+    const M3U8_PFX_GM_KEY  = '__LSR_m3u8pfx__';
+
+    /** GM storage keys for downloads scoped to this tab so downloads don't leak across tabs. */
     const DOWNLOADS_GM_KEY  = '__LSR_downloads_' + TAB_ID + '__';
     const NEXT_ID_GM_KEY    = '__LSR_nextId_'    + TAB_ID + '__';
 
@@ -905,19 +908,20 @@
 
     // ─── State persistence ────────────────────────────────────────────────────────
 
-    /** Persist the detected-streams state to IDB (debounced). */
-    async function _persistDetectedStreams() {
-        await _idbPut('detectedStreams',      [...detectedStreams]);
-        await _idbPut('streamMimeTypes',      [...streamMimeTypes.entries()]);
-        await _idbPut('detectedM3U8Prefixes', [...detectedM3U8Prefixes]);
+    /** Persist the detected-streams state to GM storage (works across all pages and userscript managers). */
+    function _persistDetectedStreams() {
+        try {
+            GM_setValue(STREAMS_GM_KEY,  JSON.stringify([...detectedStreams]));
+            GM_setValue(MIMES_GM_KEY,    JSON.stringify([...streamMimeTypes.entries()]));
+            GM_setValue(M3U8_PFX_GM_KEY, JSON.stringify([...detectedM3U8Prefixes]));
+        } catch (e) { console.warn('[LivestreamRecorder] GM_setValue streams failed:', e); }
     }
 
     /**
      * Synchronously commit the current download state to GM_setValue storage.
      * Safe to call from a `beforeunload` handler because GM_setValue is
      * synchronous in Tampermonkey/Violentmonkey and does not require an async
-     * context.  The IDB write is inherently async and may not complete before
-     * the page is torn down, so this backup is the only reliable flush on unload.
+     * context.
      */
     function _persistDownloadsSync() {
         const snapshot = [...activeDownloads.values()].map((dl) => ({
@@ -936,8 +940,8 @@
         } catch (e) { console.warn('[LivestreamRecorder] GM_setValue flush failed:', e); }
     }
 
-    /** Persist the download-history state to IDB (debounced on progress; immediate on finals). */
-    async function _persistDownloads() {
+    /** Persist the download-history state to GM storage. */
+    function _persistDownloads() {
         const snapshot = [...activeDownloads.values()].map((dl) => ({
             id:           dl.id,
             url:          dl.url,
@@ -948,13 +952,10 @@
             status:       dl.status,
             bytesWritten: dl.bytesWritten,
         }));
-        // Sync backup first (completes before async IDB, which may not finish on unload).
         try {
             GM_setValue(DOWNLOADS_GM_KEY, JSON.stringify(snapshot));
             GM_setValue(NEXT_ID_GM_KEY,   String(nextId));
-        } catch (e) { console.warn('[LivestreamRecorder] GM_setValue backup failed:', e); }
-        await _idbPut(DOWNLOADS_IDB_KEY, snapshot);
-        await _idbPut(NEXT_ID_IDB_KEY,   nextId);
+        } catch (e) { console.warn('[LivestreamRecorder] GM_setValue downloads failed:', e); }
     }
 
     const _debouncedPersistStreams   = _debounce(_persistDetectedStreams, 500);
@@ -962,38 +963,39 @@
 
     /**
      * Restore persisted state on load.
+     * Reads directly from GM_getValue, which is global across all pages and
+     * all userscript managers — unlike IDB which can be per-page-origin.
      * Downloads that were `downloading` are marked for automatic resumption;
      * all other terminal statuses are shown as-is.
      */
-    async function _restoreState() {
-        let [streams, mimeEntries, m3u8Prefixes, downloads, savedNextId] = await Promise.all([
-            _idbGet('detectedStreams'),
-            _idbGet('streamMimeTypes'),
-            _idbGet('detectedM3U8Prefixes'),
-            _idbGet(DOWNLOADS_IDB_KEY),
-            _idbGet(NEXT_ID_IDB_KEY),
-        ]);
+    function _restoreState() {
+        // Restore streams from GM storage.
+        let streams = null, mimeEntries = null, m3u8Prefixes = null;
+        try {
+            const rawStreams = GM_getValue(STREAMS_GM_KEY, null);
+            if (rawStreams) streams = JSON.parse(rawStreams);
+            const rawMimes = GM_getValue(MIMES_GM_KEY, null);
+            if (rawMimes) mimeEntries = JSON.parse(rawMimes);
+            const rawPfx = GM_getValue(M3U8_PFX_GM_KEY, null);
+            if (rawPfx) m3u8Prefixes = JSON.parse(rawPfx);
+        } catch (e) { console.warn('[LivestreamRecorder] GM_getValue streams corrupt, starting fresh:', e); }
 
-        // Fall back to the GM_setValue backup when IDB has no entry (null) OR
-        // has an empty array — either means the download write didn't commit
-        // before the last page unload.  If the GM backup is also empty that
-        // means clearDownloads() ran intentionally, so we leave the list empty.
-        if (downloads === null || (Array.isArray(downloads) && downloads.length === 0)) {
-            try {
-                const raw = GM_getValue(DOWNLOADS_GM_KEY, null);
-                if (raw) {
-                    const parsed = JSON.parse(raw);
-                    if (Array.isArray(parsed) && parsed.length > 0) {
-                        downloads = parsed;
-                        const rawId = GM_getValue(NEXT_ID_GM_KEY, null);
-                        if (rawId !== null && savedNextId === null) {
-                            const parsedNextId = parseInt(rawId, 10);
-                            if (!isNaN(parsedNextId)) savedNextId = parsedNextId;
-                        }
+        // Restore downloads from GM storage.
+        let downloads = null, savedNextId = null;
+        try {
+            const raw = GM_getValue(DOWNLOADS_GM_KEY, null);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed) && parsed.length > 0) {
+                    downloads = parsed;
+                    const rawId = GM_getValue(NEXT_ID_GM_KEY, null);
+                    if (rawId !== null) {
+                        const parsedNextId = parseInt(rawId, 10);
+                        if (!isNaN(parsedNextId)) savedNextId = parsedNextId;
                     }
                 }
-            } catch (e) { /* corrupt data */ }
-        }
+            }
+        } catch (e) { console.warn('[LivestreamRecorder] GM_getValue downloads corrupt, starting fresh:', e); }
 
         if (Array.isArray(streams))      streams.forEach((url)      => detectedStreams.add(url));
         if (Array.isArray(mimeEntries))  mimeEntries.forEach(([url, mimeType]) => streamMimeTypes.set(url, mimeType));
@@ -1427,14 +1429,10 @@
             }
         });
 
-        // Restore all persisted state (streams, downloads, directory handle) from IDB,
-        // then resume any downloads that were active when the tab was last unloaded.
-        // The periodic flush interval is started here — after _restoreState has fully
-        // populated activeDownloads — so its very first snapshot is never empty.
-        // Starting it before the restore completes would let it capture an empty
-        // activeDownloads snapshot which (due to the FIFO IDB write ordering) would
-        // then be committed to IDB *after* the reads, wiping the persisted downloads.
-        Promise.all([_restoreState(), _loadHandleFromIDB()]).then(async ([, handle]) => {
+        // Restore state from GM storage synchronously, then load the directory
+        // handle from IDB and resume any downloads that were active on last unload.
+        _restoreState();
+        _loadHandleFromIDB().then(async (handle) => {
             await _applyDirectoryHandle(handle);
             _resumeRestoredDownloads();
 
