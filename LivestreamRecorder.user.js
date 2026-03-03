@@ -12,6 +12,7 @@
 // @grant        unsafeWindow
 // @connect      *
 // @run-at       document-start
+// @require      https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/StreamSaver.min.js
 // ==/UserScript==
 
 (function () {
@@ -906,6 +907,69 @@
         }
     }
 
+    /**
+     * Wraps a StreamSaver.js WritableStream so it matches the
+     * FileSystemWritableFileStream interface used throughout the download functions:
+     * direct .write() / .close() calls, and a no-op .seek() (StreamSaver is
+     * append-only).  ArrayBuffers are converted to Uint8Array because StreamSaver
+     * only accepts typed arrays.
+     * @param {WritableStream} ws - stream returned by streamSaver.createWriteStream()
+     */
+    function _wrapStreamSaverWritable(ws) {
+        const writer = ws.getWriter();
+        return {
+            write(data) {
+                const chunk = (data instanceof ArrayBuffer) ? new Uint8Array(data) : data;
+                return writer.write(chunk);
+            },
+            seek()     { return Promise.resolve(); },
+            truncate() { return Promise.resolve(); },
+            close()    { return writer.close(); },
+            abort(r)   { return writer.abort(r); },
+        };
+    }
+
+    /**
+     * Creates a virtual FileSystemDirectoryHandle-compatible object backed by
+     * StreamSaver.js.  Each getFileHandle() call opens a new streaming download
+     * to the browser's Downloads folder; no persistent directory handle or
+     * user-selected path is involved.
+     */
+    function _makeStreamSaverDirHandle() {
+        return {
+            name: 'Downloads',
+            _isStreamSaver: true,
+            queryPermission()   { return Promise.resolve('granted'); },
+            requestPermission() { return Promise.resolve('granted'); },
+            getFileHandle(filename) {
+                return Promise.resolve({
+                    createWritable() {
+                        try {
+                            return Promise.resolve(
+                                _wrapStreamSaverWritable(window.streamSaver.createWriteStream(filename))
+                            );
+                        } catch (e) {
+                            return Promise.reject(new Error('StreamSaver.js failed to create stream: ' + e.message));
+                        }
+                    },
+                    // getFile() is never called for StreamSaver handles: resumeDownload()
+                    // exits early via the _isStreamSaver guard before reaching this point.
+                    getFile() { return Promise.resolve(new File([], filename)); },
+                });
+            },
+        };
+    }
+
+    /**
+     * Activate the StreamSaver.js fallback as the current download destination.
+     * Called when showDirectoryPicker() is unavailable (e.g. Firefox) so that
+     * recordings can proceed without a directory-selection step.
+     */
+    function _activateStreamSaver() {
+        downloadDirHandle = _makeStreamSaverDirHandle();
+        if (elDirName) elDirName.textContent = 'Downloads (StreamSaver)';
+    }
+
     // ─── State persistence ────────────────────────────────────────────────────────
 
     /** Persist the detected-streams state to GM storage (works across all pages and userscript managers). */
@@ -1056,8 +1120,9 @@
      * @param {object} dl - download record with `_isRestored` already deleted
      */
     async function resumeDownload(dl) {
-        // No directory handle, or a live stream that cannot be seeked/resumed.
-        if (!downloadDirHandle || dl.isWS || dl.isWebRTC) {
+        // No directory handle, a live stream that cannot be seeked/resumed, or a
+        // StreamSaver handle (append-only; random-access resume is not supported).
+        if (!downloadDirHandle || dl.isWS || dl.isWebRTC || downloadDirHandle._isStreamSaver) {
             dl.status = 'interrupted';
             updateUI();
             _persistDownloads();
@@ -1151,11 +1216,6 @@
 }
 .lsr-btn:hover { background: #1a5276; }
 .lsr-dir-name { font-size: 11px; color: #7f8c8d; margin-top: 4px; word-break: break-all; }
-.lsr-drop-zone {
-    border: 1px dashed #2c3e50; border-radius: 4px; color: #5d6d7e;
-    font-size: 11px; padding: 6px; text-align: center; margin-top: 4px; cursor: default;
-}
-.lsr-drop-zone.lsr-drag-over { border-color: #3498db; color: #3498db; background: rgba(52,152,219,.08); }
 .lsr-stream-item {
     background: #0d1b2a; border: 1px solid #2c3e50; border-radius: 4px;
     padding: 5px 8px; margin-bottom: 4px; display: flex; align-items: center; gap: 6px;
@@ -1236,7 +1296,6 @@
     <div class="lsr-label">Download Directory</div>
     <button class="lsr-btn" id="lsr-select-dir">📂 Select Directory…</button>
     <div class="lsr-dir-name" id="lsr-dir-name">No directory selected</div>
-    <div class="lsr-drop-zone" id="lsr-drop-zone">📁 …or drop a folder here</div>
   </div>
   <div class="lsr-section">
     <div class="lsr-label">Detected Streams <button class="lsr-clear-btn" id="lsr-clear-streams">Clear</button></div>
@@ -1267,44 +1326,6 @@
         });
         panel.querySelector('#lsr-clear-streams').addEventListener('click', clearDetectedStreams);
         panel.querySelector('#lsr-clear-downloads').addEventListener('click', clearDownloads);
-
-        const dropZone = panel.querySelector('#lsr-drop-zone');
-        dropZone.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            e.dataTransfer.dropEffect = 'copy';
-            dropZone.classList.add('lsr-drag-over');
-        });
-        dropZone.addEventListener('dragleave', (e) => {
-            if (!dropZone.contains(e.relatedTarget)) dropZone.classList.remove('lsr-drag-over');
-        });
-        dropZone.addEventListener('drop', (e) => {
-            e.preventDefault();
-            dropZone.classList.remove('lsr-drag-over');
-            const item = e.dataTransfer.items && e.dataTransfer.items[0];
-            if (!item || item.kind !== 'file') return;
-            if (typeof item.getAsFileSystemHandle !== 'function') {
-                alert(
-                    '[Livestream Recorder] Drag-and-drop directory selection is not available in this browser.\n' +
-                    'Please use the "Select Directory…" button instead.'
-                );
-                return;
-            }
-            // getAsFileSystemHandle() must be called synchronously inside the drop handler.
-            item.getAsFileSystemHandle().then(async (handle) => {
-                if (!handle || handle.kind !== 'directory') {
-                    alert('[Livestream Recorder] Please drop a folder, not a file.');
-                    return;
-                }
-                await _applyDirectoryHandle(handle);
-                if (downloadDirHandle) {
-                    await _saveHandleToIDB(downloadDirHandle);
-                    DIR_CHANNEL.postMessage({ type: 'dirChanged', handle: downloadDirHandle });
-                }
-            }).catch((e) => {
-                console.error('[LivestreamRecorder] Failed to get directory handle from drop:', e);
-                alert('[Livestream Recorder] Could not access the dropped folder: ' + e.message);
-            });
-        });
 
         makeDraggable(panel, panel.querySelector('#lsr-header'));
         updateUI();
@@ -1345,22 +1366,28 @@
     }
 
     async function selectDirectory() {
-        if (typeof window.showDirectoryPicker !== 'function') {
-            alert(
-                '[Livestream Recorder] The File System Access API is not available in this browser.\n' +
-                'Please use Chrome 86+, Edge 86+, or another Chromium-based browser.'
-            );
+        if (typeof window.showDirectoryPicker === 'function') {
+            try {
+                downloadDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+                if (elDirName) elDirName.textContent = downloadDirHandle.name;
+                await _saveHandleToIDB(downloadDirHandle);
+                DIR_CHANNEL.postMessage({ type: 'dirChanged', handle: downloadDirHandle });
+            } catch (e) {
+                if (e.name !== 'AbortError') console.error('[LivestreamRecorder]', e);
+            }
             return;
         }
-        try {
-            downloadDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-            if (elDirName) elDirName.textContent = downloadDirHandle.name;
-            // Persist to IDB and notify other tabs.
-            await _saveHandleToIDB(downloadDirHandle);
-            DIR_CHANNEL.postMessage({ type: 'dirChanged', handle: downloadDirHandle });
-        } catch (e) {
-            if (e.name !== 'AbortError') console.error('[LivestreamRecorder]', e);
+        // Fallback: stream files to the browser's Downloads folder via StreamSaver.js.
+        // No directory dialog is shown — each recording is saved as an individual
+        // file directly in Downloads.
+        if (typeof window.streamSaver !== 'undefined') {
+            _activateStreamSaver();
+            return;
         }
+        alert(
+            '[Livestream Recorder] The File System Access API is not available in this browser.\n' +
+            'Please use Chrome 86+, Edge 86+, or another Chromium-based browser.'
+        );
     }
 
     function makeDraggable(el, handle) {
@@ -1478,6 +1505,15 @@
         _restoreState();
         _loadHandleFromIDB().then(async (handle) => {
             await _applyDirectoryHandle(handle);
+
+            // If no persistent directory handle was restored and the File System
+            // Access API is unavailable (e.g. Firefox), automatically activate the
+            // StreamSaver fallback so recordings work without an extra click.
+            if (!downloadDirHandle && typeof window.showDirectoryPicker !== 'function' &&
+                    typeof window.streamSaver !== 'undefined') {
+                _activateStreamSaver();
+            }
+
             _resumeRestoredDownloads();
 
             // The debounced save is reset by each progress event and may never fire
