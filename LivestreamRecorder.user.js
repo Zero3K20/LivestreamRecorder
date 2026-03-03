@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.5
+// @version      1.4.6
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -1151,6 +1151,11 @@
 }
 .lsr-btn:hover { background: #1a5276; }
 .lsr-dir-name { font-size: 11px; color: #7f8c8d; margin-top: 4px; word-break: break-all; }
+.lsr-drop-zone {
+    border: 1px dashed #2c3e50; border-radius: 4px; color: #5d6d7e;
+    font-size: 11px; padding: 6px; text-align: center; margin-top: 4px; cursor: default;
+}
+.lsr-drop-zone.lsr-drag-over { border-color: #3498db; color: #3498db; background: rgba(52,152,219,.08); }
 .lsr-stream-item {
     background: #0d1b2a; border: 1px solid #2c3e50; border-radius: 4px;
     padding: 5px 8px; margin-bottom: 4px; display: flex; align-items: center; gap: 6px;
@@ -1231,6 +1236,7 @@
     <div class="lsr-label">Download Directory</div>
     <button class="lsr-btn" id="lsr-select-dir">📂 Select Directory…</button>
     <div class="lsr-dir-name" id="lsr-dir-name">No directory selected</div>
+    <div class="lsr-drop-zone" id="lsr-drop-zone">📁 …or drop a folder here</div>
   </div>
   <div class="lsr-section">
     <div class="lsr-label">Detected Streams <button class="lsr-clear-btn" id="lsr-clear-streams">Clear</button></div>
@@ -1261,6 +1267,44 @@
         });
         panel.querySelector('#lsr-clear-streams').addEventListener('click', clearDetectedStreams);
         panel.querySelector('#lsr-clear-downloads').addEventListener('click', clearDownloads);
+
+        const dropZone = panel.querySelector('#lsr-drop-zone');
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+            dropZone.classList.add('lsr-drag-over');
+        });
+        dropZone.addEventListener('dragleave', (e) => {
+            if (!dropZone.contains(e.relatedTarget)) dropZone.classList.remove('lsr-drag-over');
+        });
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('lsr-drag-over');
+            const item = e.dataTransfer.items && e.dataTransfer.items[0];
+            if (!item || item.kind !== 'file') return;
+            if (typeof item.getAsFileSystemHandle !== 'function') {
+                alert(
+                    '[Livestream Recorder] Drag-and-drop directory selection is not available in this browser.\n' +
+                    'Please use the "Select Directory…" button instead.'
+                );
+                return;
+            }
+            // getAsFileSystemHandle() must be called synchronously inside the drop handler.
+            item.getAsFileSystemHandle().then(async (handle) => {
+                if (!handle || handle.kind !== 'directory') {
+                    alert('[Livestream Recorder] Please drop a folder, not a file.');
+                    return;
+                }
+                await _applyDirectoryHandle(handle);
+                if (downloadDirHandle) {
+                    await _saveHandleToIDB(downloadDirHandle);
+                    DIR_CHANNEL.postMessage({ type: 'dirChanged', handle: downloadDirHandle });
+                }
+            }).catch((e) => {
+                console.error('[LivestreamRecorder] Failed to get directory handle from drop:', e);
+                alert('[Livestream Recorder] Could not access the dropped folder: ' + e.message);
+            });
+        });
 
         makeDraggable(panel, panel.querySelector('#lsr-header'));
         updateUI();
