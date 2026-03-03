@@ -94,7 +94,7 @@ async function getWritable(filename) {
             const perm = await dirHandle.queryPermission({ mode: 'readwrite' });
             if (perm === 'granted') {
                 const fh = await dirHandle.getFileHandle(filename, { create: true });
-                return { writable: await fh.createWritable(), savedToDir: true };
+                return { writable: await fh.createWritable({ keepExistingData: true }), savedToDir: true };
             }
         }
     } catch { /* fall through to OPFS */ }
