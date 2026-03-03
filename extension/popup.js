@@ -188,6 +188,7 @@ async function renderDownloads() {
     for (const dl of downloads) {
         const statusKey = dl.status.startsWith('error') ? 'error' : dl.status;
         const isDone    = dl.status === 'completed';
+        const isStopped = dl.status === 'stopped';
         const isActive  = dl.status === 'downloading';
         const item      = document.createElement('div');
         item.className  = 'dl-item';
@@ -197,8 +198,8 @@ async function renderDownloads() {
             `  <span class="dl-size">${formatBytes(dl.bytesWritten)}</span>` +
             `  <span class="dl-status status-${escapeHTML(statusKey)}">${escapeHTML(dl.status)}</span>` +
             (isActive ? `<button class="stop-btn" data-id="${dl.id}">■ Stop</button>` : '') +
-            (isDone && !dl.savedToDir && !dl.autoSaved ? `<button class="save-btn" data-filename="${escapeHTML(dl.filename)}">💾 Save</button>` : '') +
-            (isDone && dl.autoSaved ? `<span class="dl-autosaved">✓ Saved to Downloads</span>` : '') +
+            ((isDone || isStopped) && !dl.savedToDir && !dl.autoSaved ? `<button class="save-btn" data-filename="${escapeHTML(dl.filename)}">💾 Save</button>` : '') +
+            ((isDone || isStopped) && dl.autoSaved ? `<span class="dl-autosaved">✓ Saved to Downloads</span>` : '') +
             `</div>`;
         el.appendChild(item);
     }
