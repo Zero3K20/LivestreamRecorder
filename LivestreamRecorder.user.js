@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.8
+// @version      1.4.9
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -1397,6 +1397,13 @@
             if (e.data && e.data.type === 'dirChanged' && e.data.handle) {
                 _applyDirectoryHandle(e.data.handle);
             }
+            // When a newly opened tab asks for the current directory, respond with
+            // ours so it can pick it up without relying solely on IDB.  If multiple
+            // tabs respond, _applyDirectoryHandle is idempotent for the same handle
+            // so duplicate dirChanged messages are harmless.
+            if (e.data && e.data.type === 'dirRequest' && downloadDirHandle) {
+                DIR_CHANNEL.postMessage({ type: 'dirChanged', handle: downloadDirHandle });
+            }
         };
 
         // Warn before navigating away while resumable (HLS/HTTP) downloads are active,
@@ -1425,6 +1432,14 @@
         _restoreState();
         _loadHandleFromIDB().then(async (handle) => {
             await _applyDirectoryHandle(handle);
+
+            // If IDB didn't provide a usable handle, ask any already-open tab to
+            // share its current directory so the user doesn't have to re-select.
+            // If no tab responds the user will be prompted when they start a download,
+            // which is the correct fallback behavior.
+            if (!downloadDirHandle) {
+                DIR_CHANNEL.postMessage({ type: 'dirRequest' });
+            }
 
             _resumeRestoredDownloads();
 
