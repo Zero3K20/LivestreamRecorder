@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.10
+// @version      1.4.11
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -26,7 +26,7 @@
     const STREAM_MIME_RE = /video\/x-flv|video\/mp2t|application\/(x-mpegurl|vnd\.apple\.mpegurl)/i;
 
     /** WebSocket URL patterns that indicate a binary media stream. */
-    const WS_STREAM_RE = /\.(flv|ts|m4s|mp4|aac)(\?|$)/i;
+    const WS_STREAM_RE = /\.(flv|ts|m4s|mp4|aac)(\?|&|$)/i;
 
     /** Number of binary WebSocket frames required to declare a stream (avoids one-shot control frames). */
     const WS_BINARY_DETECT_COUNT = 2;
@@ -623,10 +623,23 @@
 
     // ─── Stream detection ─────────────────────────────────────────────────────────
 
-    const STREAM_RE = /\.(m3u8|flv|mpd|ts)(\?|$)/i;
+    const STREAM_RE = /\.(m3u8|flv|mpd|ts)(\?|&|$)/i;
 
     function isStreamURL(url) {
-        return typeof url === 'string' && STREAM_RE.test(url);
+        if (typeof url !== 'string') return false;
+        if (STREAM_RE.test(url)) return true;
+        // Scan decoded query-parameter values for embedded stream filenames,
+        // e.g. ?stream=roomid.flv&token=xxx  or  ?url=https%3A%2F%2Fcdn%2Fstream.flv
+        // Only attempt URL parsing when a query string is actually present.
+        if (url.indexOf('?') !== -1) {
+            try {
+                const params = new URL(url).searchParams;
+                for (const v of params.values()) {
+                    if (STREAM_RE.test(v)) return true;
+                }
+            } catch { /* ignore unparseable URLs */ }
+        }
+        return false;
     }
 
     /** Returns true for ws:// / wss:// URLs that look like binary media streams. */
