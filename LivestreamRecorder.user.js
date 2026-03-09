@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.12
+// @version      1.4.13
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -33,6 +33,21 @@
 
     /** Stop watching a WebSocket for binary frames after this many total messages with no detection. */
     const WS_BINARY_GIVE_UP_COUNT = 50;
+
+    /**
+     * Maximum number of characters to scan in a fetch response body when looking for
+     * embedded stream URLs (e.g. server-action JSON returning a live stream URL).
+     * 500 000 chars (~500 KB) comfortably covers typical API/RSC payloads while
+     * preventing excessive memory use on large page responses.
+     */
+    const MAX_RESPONSE_BODY_SCAN_CHARS = 500000;
+
+    /**
+     * Maximum number of characters to scan in a Worker postMessage payload.
+     * Player init messages (e.g. mpegts.js) are always tiny; 200 000 chars is
+     * generous while keeping overhead negligible for any unexpectedly large message.
+     */
+    const MAX_WORKER_MSG_SCAN_CHARS = 200000;
 
     // When @grant directives are present, some userscript managers (Violentmonkey,
     // Greasemonkey on Firefox) run the script in a sandboxed context where `window`
@@ -681,6 +696,26 @@
         }
     }
 
+    /**
+     * Scan a block of text (JSON body, RSC payload, Worker postMessage data, etc.)
+     * for embedded stream URLs.  Finds raw http/https URLs containing stream file
+     * extensions so we can detect streams that are delivered inside API responses
+     * or forwarded to Web Worker threads rather than flowing through XHR/fetch
+     * directly (e.g. mpegts.js with enableWorker:true).
+     * @param {string} text
+     */
+    function scanTextForStreamURLs(text) {
+        const re = /https?:\/\/[^\s"'<>\\{}[\]|^`\x00-\x1f]{5,}/gi;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+            try {
+                // Trim any trailing JSON/text punctuation that got included.
+                const candidate = m[0].replace(/[)\]}>,"':;\\]+$/, '');
+                if (candidate && isStreamURL(candidate)) addDetectedStream(candidate);
+            } catch { /* ignore */ }
+        }
+    }
+
     // Hook XMLHttpRequest — URL-pattern check on open(); MIME-type check on send().
     const _xhrOpen = _win.XMLHttpRequest.prototype.open;
     _win.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
@@ -725,11 +760,21 @@
             if (urlMatched) addDetectedStream(full);
             const promise = _fetch.call(this, input, ...rest);
             if (!urlMatched) {
-                // Only inspect response MIME type for URLs that didn't match by extension.
+                // Inspect response MIME type for URLs that didn't match by extension.
+                // Also scan text/JSON/RSC bodies for embedded stream URLs — this catches
+                // cases where the stream URL is returned inside an API response (e.g. a
+                // Next.js server-action that returns live stream data).
                 promise.then((response) => {
                     try {
                         const ct = response.headers.get('content-type') || '';
-                        if (STREAM_MIME_RE.test(ct)) addDetectedStream(full, ct);
+                        if (STREAM_MIME_RE.test(ct)) {
+                            addDetectedStream(full, ct);
+                        } else if (/^(text\/|application\/(json|x-ndjson|x-component|x-www-form-urlencoded))/i.test(ct)) {
+                            const clone = response.clone();
+                            clone.text().then(text => {
+                                if (text && text.length < MAX_RESPONSE_BODY_SCAN_CHARS) scanTextForStreamURLs(text);
+                            }).catch(() => {});
+                        }
                     } catch { /* ignore */ }
                 }).catch(() => {});
             }
@@ -781,6 +826,26 @@
         _win.WebSocket.OPEN       = _OrigWebSocket.OPEN;
         _win.WebSocket.CLOSING    = _OrigWebSocket.CLOSING;
         _win.WebSocket.CLOSED     = _OrigWebSocket.CLOSED;
+    }
+
+    // Hook Worker.prototype.postMessage — detect stream URLs sent to Web Worker threads.
+    // Some media players (e.g. mpegts.js with enableWorker:true) perform all HTTP
+    // requests inside a dedicated worker, bypassing the main-thread XHR and fetch
+    // hooks above.  When the main thread sends the player configuration to the worker
+    // via postMessage the stream URL is visible here, so we scan the serialised data.
+    const _OrigWorkerProto = _win.Worker && _win.Worker.prototype;
+    if (_OrigWorkerProto && typeof _OrigWorkerProto.postMessage === 'function') {
+        const _origWorkerPostMsg = _OrigWorkerProto.postMessage;
+        _OrigWorkerProto.postMessage = function (data, ...rest) {
+            try {
+                if (data !== null && data !== undefined) {
+                    const text = typeof data === 'string' ? data
+                               : (typeof data === 'object' ? JSON.stringify(data) : null);
+                    if (text && text.length < MAX_WORKER_MSG_SCAN_CHARS) scanTextForStreamURLs(text);
+                }
+            } catch { /* ignore hook errors */ }
+            return _origWorkerPostMsg.apply(this, [data, ...rest]);
+        };
     }
 
     // Hook HTMLMediaElement.srcObject — detect WebRTC streams (RTCPeerConnection).
