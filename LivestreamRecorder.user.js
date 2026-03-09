@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.11
+// @version      1.4.12
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -804,6 +804,27 @@
                         }
                     } catch { /* ignore hook errors */ }
                     return _origSrcObjectSet.call(this, val);
+                },
+                configurable: true,
+            });
+        }
+    }
+
+    // Hook HTMLMediaElement.src setter — catches stream URLs assigned via `video.src = url`.
+    // Complements the XHR/fetch hooks and the srcObject hook: `video.src` assignments use
+    // the browser's built-in networking and never pass through XMLHttpRequest or fetch.
+    if (_MediaElement && _MediaElement.prototype) {
+        const _srcDesc = Object.getOwnPropertyDescriptor(_MediaElement.prototype, 'src');
+        if (_srcDesc && _srcDesc.set) {
+            const _origSrcSet = _srcDesc.set;
+            Object.defineProperty(_MediaElement.prototype, 'src', {
+                get: _srcDesc.get,
+                set(val) {
+                    try {
+                        const full = resolveURL(location.href, String(val || ''));
+                        if (isStreamURL(full)) addDetectedStream(full);
+                    } catch { /* ignore hook errors */ }
+                    return _origSrcSet.call(this, val);
                 },
                 configurable: true,
             });
