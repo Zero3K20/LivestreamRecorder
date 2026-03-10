@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.19
+// @version      1.4.20
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -114,6 +114,22 @@
      * @type {Map<string, object>}
      */
     const _fetchTaps = new Map();
+
+    /**
+     * Rolling-buffer pre-captures of the player's active streaming fetches.
+     * Keyed by origin+pathname (same format as _fetchTaps/_xhrTaps).
+     * Populated automatically by the fetch hook for every detected stream URL
+     * so that _downloadViaTap can start writing to disk immediately from the
+     * player's *current* connection instead of waiting for the player to
+     * reconnect.  This is critical for long-lived FLV push streams where the
+     * player opens a single HTTP connection at page load and keeps it open for
+     * minutes or hours without reconnecting.
+     * @type {Map<string, {reader: ReadableStreamDefaultReader, buffer: Uint8Array[], totalBytes: number, onChunk: Function|null, onDone: Function|null, stopped: boolean}>}
+     */
+    const _preCaptures = new Map();
+
+    /** Maximum bytes held per pre-capture rolling window (8 MB). */
+    const MAX_PRE_CAPTURE_BYTES = 8 * 1024 * 1024;
 
     /**
      * Shared cleanup helper for recording taps.
@@ -442,26 +458,25 @@
     }
 
     /**
-     * Download a stream by tapping into the page player's own XHR requests to
-     * the same URL endpoint.  Used as a last resort when both GM_xmlhttpRequest
+     * Download a stream by tapping into the page player's own XHR/fetch requests
+     * to the same URL endpoint.  Used as a last resort when both GM_xmlhttpRequest
      * and the page fetch return 403 — which happens when the server binds the
-     * stream to the player's session via a short-lived token embedded in the
-     * URL: the player holds an open connection obtained while the token was
-     * fresh, but any new independent request using the (now-expired) token is
-     * rejected.
+     * stream to the player's session via a short-lived token embedded in the URL.
      *
-     * Rather than making a new network request, this function registers a tap
-     * keyed by the URL's origin+pathname in both _xhrTaps and _fetchTaps.  The
-     * _xhrSend and _win.fetch hooks intercept the next matching request and
-     * forward each incoming chunk to the file.  Because the player reconnects
-     * periodically (or immediately, for live streams), recording begins as soon
-     * as the next XHR or fetch to that endpoint fires.  This also handles
-     * automatic token rotation: when the player refreshes its token and
-     * reconnects with a new URL query string, the new request is intercepted
-     * too (same origin+path).
+     * Two modes:
      *
-     * If neither XHR nor fetch fires within 30 seconds the tap times out with
-     * a clear error rather than hanging indefinitely.
+     * A) Pre-capture available — the fetch hook already cloned the player's active
+     *    response (see _preCaptures).  Buffered chunks are written to disk
+     *    immediately; future chunks are forwarded as they arrive.  Also registers
+     *    in _fetchTaps/_xhrTaps so recording continues seamlessly after the
+     *    player's current connection ends and it reconnects.  A 30-second timeout
+     *    is armed only *after* the pre-captured connection ends (to handle the
+     *    "stream ended permanently" case gracefully).
+     *
+     * B) No pre-capture — registers a tap keyed by origin+pathname in both
+     *    _xhrTaps and _fetchTaps and waits for the player's next request to that
+     *    endpoint.  A 30-second no-data timeout rejects the Promise so the UI
+     *    never hangs indefinitely.
      *
      * @param {string} url
      * @param {FileSystemWritableFileStream} writable  - already open, caller closes it
@@ -475,6 +490,89 @@
             tapKey = p.origin + p.pathname;
         } catch { /* use full URL as fallback key */ }
 
+        const preCapture = _preCaptures.get(tapKey);
+
+        if (preCapture) {
+            // ── Mode A: use the player's already-active connection ──────────────────
+            // We have a rolling buffer of chunks from the player's current fetch.
+            // Take ownership: stop the pre-capture's buffering and start forwarding
+            // directly to the file.
+            _preCaptures.delete(tapKey);
+
+            return new Promise((resolve, reject) => {
+                const tap = {
+                    writable,
+                    onProgress,
+                    stopSignal,
+                    resolve,
+                    reject,
+                    pendingWrite: Promise.resolve(),
+                    _stopPoll: null,
+                    _timeoutId: null,
+                    _tapKey: tapKey,
+                };
+                // Also register for future reconnections so recording continues
+                // after the player's current connection ends.
+                _xhrTaps.set(tapKey, tap);
+                _fetchTaps.set(tapKey, tap);
+
+                const stopPoll = setInterval(() => {
+                    if (stopSignal.stopped) {
+                        _teardownTap(tap);
+                        preCapture.stopped = true;
+                        preCapture.onChunk = null;
+                        preCapture.onDone = null; // prevent stale reconnect timeout
+                        tap.pendingWrite.then(resolve, reject);
+                    }
+                }, 500);
+                tap._stopPoll = stopPoll;
+
+                const writeChunk = (chunk) => {
+                    tap.pendingWrite = tap.pendingWrite
+                        .then(() => { if (!stopSignal.stopped) return writable.write(chunk); })
+                        .then(() => { if (!stopSignal.stopped) onProgress(chunk.byteLength); })
+                        .catch(err => {
+                            console.warn('[LivestreamRecorder] Pre-capture write error:', err);
+                            _teardownTap(tap);
+                            preCapture.stopped = true;
+                            preCapture.onChunk = null;
+                            preCapture.onDone = null; // prevent stale reconnect timeout
+                            tap.reject(err);
+                        });
+                };
+
+                // When the pre-capture's connection ends, arm a 30-second reconnect
+                // timeout: if the player reconnects quickly (live stream segment
+                // boundary), the tap intercepts it and cancels the timeout; if not
+                // (stream ended permanently), we resolve cleanly.
+                preCapture.onDone = () => {
+                    if (!stopSignal.stopped && !tap._timeoutId) {
+                        tap._timeoutId = setTimeout(() => {
+                            _teardownTap(tap);
+                            tap.pendingWrite.then(resolve).catch(reject);
+                        }, 30000);
+                    }
+                };
+
+                // Wire up live chunk forwarding BEFORE draining the buffer.
+                // JavaScript is single-threaded: the pre-capture pump's .then()
+                // callbacks are microtasks and cannot fire between these synchronous
+                // statements, so there is no race between buffer-drain and live
+                // forwarding.  Setting onChunk first ensures any chunk the pump
+                // delivers after we take ownership also goes through writeChunk.
+                preCapture.onChunk = writeChunk;
+
+                // Drain buffered chunks (rolling window — up to MAX_PRE_CAPTURE_BYTES
+                // of recent stream data).  For streams that have been playing longer
+                // than the window holds, older chunks have been discarded; recording
+                // starts from the earliest retained chunk.
+                const buffered = preCapture.buffer.splice(0);
+                preCapture.totalBytes = 0;
+                for (const chunk of buffered) writeChunk(chunk);
+            });
+        }
+
+        // ── Mode B: no pre-capture — wait for the player's next fetch/XHR ───────
         return new Promise((resolve, reject) => {
             const tap = {
                 writable,
@@ -588,6 +686,22 @@
                     // the player's session via a short-lived token — independent
                     // requests are rejected even from the page context), tap into
                     // the page player's own XHR instead of making a new request.
+                    if (!pageFetchSucceeded && !stopSignal.stopped) {
+                        // For proxy-wrapped streams (e.g. /api/stream?url=<cdn-url>),
+                        // try the inner CDN URL directly via the page's native streaming
+                        // fetch.  CDN endpoints are often publicly accessible with only a
+                        // CORS/Referer check, even when the proxy enforces one-connection-
+                        // per-token and rejects all independent requests.
+                        try {
+                            const inner = new URL(url).searchParams.get('url');
+                            if (inner && !stopSignal.stopped) {
+                                try {
+                                    await _downloadViaPageFetch(inner, writable, onProgress, stopSignal);
+                                    pageFetchSucceeded = true;
+                                } catch { /* fall through to tap */ }
+                            }
+                        } catch { /* URL parsing failed or no url= param — skip inner fallback */ }
+                    }
                     if (!pageFetchSucceeded && !stopSignal.stopped) {
                         await _downloadViaTap(url, writable, onProgress, stopSignal);
                     }
@@ -1108,6 +1222,56 @@
                                 _teardownTap(tap);
                                 tap.reject(err);
                             }
+                        });
+                    };
+                    pump();
+                }).catch(() => {});
+            }
+
+            // Pre-capture: for detected stream URLs with no active tap, clone the
+            // response body immediately and buffer chunks in a rolling window.
+            // This lets _downloadViaTap tap into the player's *current* connection
+            // rather than waiting for a reconnection — critical for long-lived FLV
+            // push streams (e.g. pc.mliveh5.com) where the player opens one HTTP
+            // connection at page load and keeps it open without reconnecting.
+            if (urlMatched && fetchTapKey === null) {
+                promise.then(response => {
+                    if (!response.ok || !response.body || response.bodyUsed) return;
+                    let pcKey;
+                    try { const p = new URL(full); pcKey = p.origin + p.pathname; }
+                    catch { pcKey = full; }
+                    // Skip if already capturing or a tap is now active.
+                    if (_preCaptures.has(pcKey) || _fetchTaps.has(pcKey)) return;
+                    let clone;
+                    try { clone = response.clone(); } catch { return; }
+                    if (!clone.body) return;
+                    const reader = clone.body.getReader();
+                    const capture = {
+                        reader, buffer: [], totalBytes: 0,
+                        onChunk: null, onDone: null, stopped: false,
+                    };
+                    _preCaptures.set(pcKey, capture);
+                    const pump = () => {
+                        reader.read().then(({ done, value }) => {
+                            if (done || capture.stopped) {
+                                _preCaptures.delete(pcKey);
+                                if (capture.onDone) capture.onDone();
+                                return;
+                            }
+                            if (capture.onChunk) {
+                                capture.onChunk(value);
+                            } else {
+                                capture.buffer.push(value);
+                                capture.totalBytes += value.byteLength;
+                                // Rolling window: discard oldest to stay within limit.
+                                while (capture.totalBytes > MAX_PRE_CAPTURE_BYTES && capture.buffer.length > 0) {
+                                    capture.totalBytes -= capture.buffer.shift().byteLength;
+                                }
+                            }
+                            pump();
+                        }).catch(() => {
+                            _preCaptures.delete(pcKey);
+                            if (capture.onDone) capture.onDone();
                         });
                     };
                     pump();
