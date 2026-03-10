@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.14
+// @version      1.4.15
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -87,6 +87,15 @@
      * @type {Set<string>}
      */
     const detectedM3U8Prefixes = new Set();
+
+    /**
+     * Inner URLs that are already wrapped by a detected proxy URL
+     * (e.g. the `url=` query parameter value of a detected `/api/stream?url=<inner>` URL).
+     * Any URL in this set is suppressed from being added as a standalone detected stream
+     * because the proxy URL supersedes it and is what the user should record.
+     * @type {Set<string>}
+     */
+    const _proxiedInnerURLs = new Set();
 
     /**
      * Stable identifier for this tab session.  sessionStorage retains the value
@@ -530,52 +539,12 @@
 
     // ─── Start / stop downloads ───────────────────────────────────────────────────
 
-    /**
-     * Resolve a proxy wrapper URL to the real underlying stream URL.
-     *
-     * Some sites (e.g. pc.mliveh5.com) use a server-side stream proxy of the form
-     *   /api/stream?url=<percent-encoded-stream-url>
-     * rather than serving the stream directly.  When the userscript detects such a
-     * URL and the user tries to record it, the proxy endpoint returns 403 for direct
-     * (non-browser) requests.  The real stream URL is in the `url` query parameter,
-     * so we extract it and download that instead.
-     *
-     * The unwrapping is iterative so double-wrapped URLs are handled correctly.
-     * It will only unwrap when the extracted value itself looks like a stream URL
-     * (passes isStreamURL) so legitimate proxy pass-through URLs are left untouched.
-     *
-     * @param {string} url
-     * @returns {string}  The innermost stream URL, or the original if no unwrapping needed.
-     */
-    function resolveProxyURL(url) {
-        let current = url;
-        // Guard against infinite loops from circular proxy chains.
-        for (let i = 0; i < 5; i++) {
-            try {
-                const parsed = new URL(current);
-                // URLSearchParams.get() already percent-decodes the value; no need for
-                // a second decodeURIComponent() call (that would corrupt %25-encoded chars).
-                const inner = parsed.searchParams.get('url');
-                if (!inner) break;
-                // Only unwrap if the inner value is itself a valid stream URL.
-                if (!isStreamURL(inner)) break;
-                current = inner;
-            } catch { break; /* malformed URL — stop iterating, return what we have */ }
-        }
-        return current;
-    }
-
     /** Creates the standard progress callback used by both startDownload and resumeDownload. */
     function _makeProgressCallback(dl) {
         return (bytes) => { dl.bytesWritten += bytes; updateUI(); _debouncedPersistDownloads(); };
     }
 
     async function startDownload(url) {
-        // Unwrap proxy URLs (e.g. /api/stream?url=<real-stream-url>) so we
-        // download from the actual stream endpoint rather than the proxy, which
-        // typically returns 403 when accessed directly.
-        url = resolveProxyURL(url);
-
         if (!downloadDirHandle) {
             alert('[Livestream Recorder] Please select a download directory first.');
             return;
@@ -728,7 +697,29 @@
             if (dir && detectedM3U8Prefixes.has(dir)) return;
         }
 
+        // Suppress inner URLs that are already wrapped by a detected proxy URL.
+        // Some sites (e.g. pc.mliveh5.com) expose a proxy endpoint of the form
+        //   /api/stream?url=<inner-stream-url>
+        // The response body scanner may detect the inner stream URL from an API
+        // response before the proxy URL is detected via the worker postMessage hook.
+        // Recording the inner URL directly would fail (403); only the proxy URL works.
+        if (_proxiedInnerURLs.has(url)) return;
+
         if (!detectedStreams.has(url)) {
+            // If this URL is a proxy wrapper with a `url=<inner>` parameter, record
+            // the inner URL as superseded and remove it from the detected set if it
+            // was added earlier (inner URL detected before proxy URL).
+            try {
+                const inner = new URL(url).searchParams.get('url');
+                if (inner) {
+                    _proxiedInnerURLs.add(inner);
+                    if (detectedStreams.has(inner)) {
+                        detectedStreams.delete(inner);
+                        streamMimeTypes.delete(inner);
+                    }
+                }
+            } catch { /* ignore malformed URLs */ }
+
             if (mimeType) streamMimeTypes.set(url, mimeType);
             detectedStreams.add(url);
             updateUI();
