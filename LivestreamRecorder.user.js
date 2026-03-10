@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.18
+// @version      1.4.19
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -106,6 +106,27 @@
      * @type {Map<string, object>}
      */
     const _xhrTaps = new Map();
+
+    /**
+     * Active fetch recording taps: same purpose as _xhrTaps but for players
+     * that use the Fetch API instead of XHR (e.g. FLV.js on pc.mliveh5.com).
+     * Both maps share the same tap objects; _downloadViaTap registers in both.
+     * @type {Map<string, object>}
+     */
+    const _fetchTaps = new Map();
+
+    /**
+     * Shared cleanup helper for recording taps.
+     * Clears the stop-signal poll and no-data timeout, then removes the tap
+     * from both _xhrTaps and _fetchTaps so no further data is forwarded.
+     * @param {object} tap
+     */
+    function _teardownTap(tap) {
+        if (tap._stopPoll) { clearInterval(tap._stopPoll); tap._stopPoll = null; }
+        if (tap._timeoutId) { clearTimeout(tap._timeoutId); tap._timeoutId = null; }
+        if (_xhrTaps.get(tap._tapKey) === tap) _xhrTaps.delete(tap._tapKey);
+        if (_fetchTaps.get(tap._tapKey) === tap) _fetchTaps.delete(tap._tapKey);
+    }
 
     /**
      * Stable identifier for this tab session.  sessionStorage retains the value
@@ -398,7 +419,9 @@
      */
     async function _downloadViaPageFetch(url, writable, onProgress, stopSignal) {
         if (typeof _win.fetch !== 'function') throw new Error('Page fetch not available');
-        const response = await _win.fetch(url);
+        // Call the original (pre-hook) fetch so this independent request does not
+        // re-trigger LSR's stream-detection hook or activate any recording tap.
+        const response = await _fetch.call(_win, url);
         if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
         if (!response.body) throw new Error('Response body not available');
 
@@ -428,20 +451,24 @@
      * rejected.
      *
      * Rather than making a new network request, this function registers a tap
-     * keyed by the URL's origin+pathname.  The _xhrSend hook then intercepts
-     * every subsequent XHR.send() call whose URL matches that key and forwards
-     * each incoming chunk to the file.  Because the player reconnects
+     * keyed by the URL's origin+pathname in both _xhrTaps and _fetchTaps.  The
+     * _xhrSend and _win.fetch hooks intercept the next matching request and
+     * forward each incoming chunk to the file.  Because the player reconnects
      * periodically (or immediately, for live streams), recording begins as soon
-     * as the next XHR to that endpoint fires.  This also handles automatic
-     * token rotation: when the player refreshes its token and reconnects with a
-     * new URL query string, the new XHR is intercepted too (same origin+path).
+     * as the next XHR or fetch to that endpoint fires.  This also handles
+     * automatic token rotation: when the player refreshes its token and
+     * reconnects with a new URL query string, the new request is intercepted
+     * too (same origin+path).
+     *
+     * If neither XHR nor fetch fires within 30 seconds the tap times out with
+     * a clear error rather than hanging indefinitely.
      *
      * @param {string} url
      * @param {FileSystemWritableFileStream} writable  - already open, caller closes it
      * @param {function(number): void} onProgress
      * @param {{ stopped: boolean }} stopSignal
      */
-    async function _downloadViaXHRTap(url, writable, onProgress, stopSignal) {
+    async function _downloadViaTap(url, writable, onProgress, stopSignal) {
         let tapKey = url;
         try {
             const p = new URL(url);
@@ -457,20 +484,35 @@
                 reject,
                 pendingWrite: Promise.resolve(),
                 _stopPoll: null,
+                _timeoutId: null,
+                _tapKey: tapKey,
             };
             _xhrTaps.set(tapKey, tap);
+            _fetchTaps.set(tapKey, tap);
 
             // Resolve promptly once the user clicks Stop.
             const stopPoll = setInterval(() => {
                 if (stopSignal.stopped) {
-                    clearInterval(stopPoll);
-                    if (_xhrTaps.get(tapKey) === tap) _xhrTaps.delete(tapKey);
+                    _teardownTap(tap);
                     tap.pendingWrite.then(resolve, reject);
                 }
             }, 500);
             // Store so the poll can be cancelled if the tap is torn down by a
             // write error rather than by the user stopping the recording.
             tap._stopPoll = stopPoll;
+
+            // No-data timeout: reject if neither XHR nor fetch fires within 30 s.
+            // Prevents an indefinite hang when the player has finished streaming
+            // or reconnects via a URL that cannot be intercepted.
+            const timeoutId = setTimeout(() => {
+                _teardownTap(tap);
+                reject(new Error(
+                    'Tap timeout: no stream data received in 30 s. ' +
+                    'The player may have finished streaming or reconnects ' +
+                    'via a URL that cannot be intercepted.'
+                ));
+            }, 30000);
+            tap._timeoutId = timeoutId;
         });
     }
 
@@ -547,7 +589,7 @@
                     // requests are rejected even from the page context), tap into
                     // the page player's own XHR instead of making a new request.
                     if (!pageFetchSucceeded && !stopSignal.stopped) {
-                        await _downloadViaXHRTap(url, writable, onProgress, stopSignal);
+                        await _downloadViaTap(url, writable, onProgress, stopSignal);
                     }
                 }
             }
@@ -968,6 +1010,8 @@
 
                 const flushChunk = function () {
                     if (tap.stopSignal.stopped) return;
+                    // Cancel the no-data timeout on first data from this XHR.
+                    if (tap._timeoutId) { clearTimeout(tap._timeoutId); tap._timeoutId = null; }
                     const res = xhr.response;
                     if (!res) return;
                     let newBytes;
@@ -989,9 +1033,7 @@
                         .then(() => tap.onProgress(chunk.byteLength))
                         .catch((err) => {
                             console.warn('[LivestreamRecorder] XHR tap write error:', err);
-                            // Tear down the tap so the file handle can be released.
-                            if (tap._stopPoll) clearInterval(tap._stopPoll);
-                            if (_xhrTaps.get(tapKey) === tap) _xhrTaps.delete(tapKey);
+                            _teardownTap(tap);
                             tap.reject(err);
                         });
                 };
@@ -1020,6 +1062,58 @@
             const urlMatched = isStreamURL(full);
             if (urlMatched) addDetectedStream(full);
             const promise = _fetch.call(this, input, ...rest);
+
+            // Fetch tap: if a recording tap is waiting for this URL endpoint,
+            // clone the response body and stream the clone to the recording file.
+            // This handles players that use fetch instead of XHR (e.g. FLV.js).
+            let fetchTapKey = null;
+            try {
+                const p = new URL(full);
+                const epKey = p.origin + p.pathname;
+                if (_fetchTaps.has(full)) fetchTapKey = full;
+                else if (_fetchTaps.has(epKey)) fetchTapKey = epKey;
+            } catch {
+                if (_fetchTaps.has(full)) fetchTapKey = full;
+            }
+            if (fetchTapKey !== null) {
+                const tap = _fetchTaps.get(fetchTapKey);
+                // Cancel the no-data timeout — a matching request is now in flight.
+                if (tap._timeoutId) { clearTimeout(tap._timeoutId); tap._timeoutId = null; }
+                promise.then(response => {
+                    if (!response.ok || !response.body) return;
+                    const clone = response.clone();
+                    if (!clone.body) return;
+                    const reader = clone.body.getReader();
+                    const pump = () => {
+                        reader.read().then(({ done, value }) => {
+                            if (done) return; // stream ended; player will reconnect if live
+                            if (tap.stopSignal.stopped || !_fetchTaps.has(fetchTapKey)) {
+                                reader.cancel().catch(() => {});
+                                return;
+                            }
+                            const chunk = value;
+                            tap.pendingWrite = tap.pendingWrite
+                                .then(() => tap.writable.write(chunk))
+                                .then(() => tap.onProgress(chunk.byteLength))
+                                .catch(err => {
+                                    console.warn('[LivestreamRecorder] Fetch tap write error:', err);
+                                    _teardownTap(tap);
+                                    tap.reject(err);
+                                });
+                            pump();
+                        }).catch(err => {
+                            // Ignore errors caused by intentional cancellation (stop signal).
+                            if (!tap.stopSignal.stopped) {
+                                console.warn('[LivestreamRecorder] Fetch tap read error:', err);
+                                _teardownTap(tap);
+                                tap.reject(err);
+                            }
+                        });
+                    };
+                    pump();
+                }).catch(() => {});
+            }
+
             if (!urlMatched) {
                 // Inspect response MIME type for URLs that didn't match by extension.
                 // Also scan text/JSON/RSC bodies for embedded stream URLs — this catches
