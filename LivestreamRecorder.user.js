@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.24
+// @version      1.4.25
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -53,6 +53,11 @@
     /** GM storage key for the debug-mode flag. */
     const DEBUG_GM_KEY = 'lsr_debug_mode';
 
+    /** Buffer of debug log lines waiting to be flushed to disk. */
+    let _debugLogBuffer = [];
+    let _debugLogFlushTimer = null;
+    let _debugLogFlushing = false;
+
     // When @grant directives are present, some userscript managers (Violentmonkey,
     // Greasemonkey on Firefox) run the script in a sandboxed context where `window`
     // is a proxy wrapper.  Replacing window.fetch or window.WebSocket on that proxy
@@ -60,12 +65,63 @@
     // `unsafeWindow` is the real page window and must be used for all API hooks.
     const _win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
-    /** When true, verbose diagnostic logs are written to console.debug. Toggle via the GM menu. */
+    /** When true, verbose diagnostic logs are written to console.debug and to a log file. Toggle via the GM menu. */
     let _debugMode = false;
     try { _debugMode = GM_getValue(DEBUG_GM_KEY, '0') === '1'; } catch { /* ignore */ }
 
+    /**
+     * Format a printf-style (%s / %d / %%) arg list into a plain string for the log file.
+     * Mirrors what console.debug does natively so file output matches console output.
+     */
+    function _fmtDbgArgs(args) {
+        if (!args.length) return '';
+        if (typeof args[0] !== 'string') return args.map(String).join(' ');
+        let i = 1;
+        const msg = String(args[0]).replace(/%%|%[sd]/g,
+            (m) => m === '%%' ? '%' : (i < args.length ? String(args[i++]) : ''));
+        const rest = args.slice(i);
+        return rest.length ? msg + ' ' + rest.join(' ') : msg;
+    }
+
+    /**
+     * Flush buffered debug log lines to lsr-debug-YYYY-MM-DD.log in the selected
+     * download directory.  No-ops silently when no directory has been chosen.
+     * Uses the same File System Access API pattern as the download functions.
+     * A re-entrance guard ensures only one flush runs at a time; any lines added
+     * while a flush is in progress will be picked up by the next iteration.
+     */
+    async function _flushDebugLog() {
+        if (_debugLogFlushing) return;
+        _debugLogFlushing = true;
+        _debugLogFlushTimer = null;
+        // Loop so lines added while we were writing are also flushed before we exit.
+        while (_debugLogBuffer.length && downloadDirHandle) {
+            const lines = _debugLogBuffer.splice(0);
+            try {
+                const date = new Date().toISOString().slice(0, 10);
+                const fileHandle = await downloadDirHandle.getFileHandle(`lsr-debug-${date}.log`, { create: true });
+                const file = await fileHandle.getFile();
+                const writable = await fileHandle.createWritable({ keepExistingData: true });
+                await writable.seek(file.size);
+                await writable.write(lines.join('\n') + '\n');
+                await writable.close();
+            } catch {
+                // best-effort — debug log write errors are silently ignored
+                break;
+            }
+        }
+        _debugLogFlushing = false;
+    }
+
     /** Emit a diagnostic log line when debug mode is enabled. */
-    const dbg = (...args) => { if (_debugMode) console.debug('[LivestreamRecorder]', ...args); };
+    const dbg = (...args) => {
+        if (!_debugMode) return;
+        console.debug('[LivestreamRecorder]', ...args);
+        // Buffer the formatted line for the debug log file.
+        _debugLogBuffer.push(`[${new Date().toISOString()}] ${_fmtDbgArgs(args)}`);
+        if (_debugLogFlushTimer !== null) clearTimeout(_debugLogFlushTimer);
+        _debugLogFlushTimer = setTimeout(_flushDebugLog, 500);
+    };
 
     // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -2321,6 +2377,9 @@ return p;
         // WebSocket and WebRTC downloads cannot survive page navigation (the live source
         // is destroyed), so they do not block the unload or show a warning.
         window.addEventListener('beforeunload', (e) => {
+            // Flush any pending debug log lines (best-effort; the async file write
+            // may not complete if the browser begins navigation immediately).
+            _flushDebugLog();
             // Always flush the current (possibly cleared) download state so that a
             // user-initiated clear is never rolled back by the page reload.
             _persistDownloadsSync();
