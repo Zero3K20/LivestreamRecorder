@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.13
+// @version      1.4.14
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -530,12 +530,52 @@
 
     // ─── Start / stop downloads ───────────────────────────────────────────────────
 
+    /**
+     * Resolve a proxy wrapper URL to the real underlying stream URL.
+     *
+     * Some sites (e.g. pc.mliveh5.com) use a server-side stream proxy of the form
+     *   /api/stream?url=<percent-encoded-stream-url>
+     * rather than serving the stream directly.  When the userscript detects such a
+     * URL and the user tries to record it, the proxy endpoint returns 403 for direct
+     * (non-browser) requests.  The real stream URL is in the `url` query parameter,
+     * so we extract it and download that instead.
+     *
+     * The unwrapping is iterative so double-wrapped URLs are handled correctly.
+     * It will only unwrap when the extracted value itself looks like a stream URL
+     * (passes isStreamURL) so legitimate proxy pass-through URLs are left untouched.
+     *
+     * @param {string} url
+     * @returns {string}  The innermost stream URL, or the original if no unwrapping needed.
+     */
+    function resolveProxyURL(url) {
+        let current = url;
+        // Guard against infinite loops from circular proxy chains.
+        for (let i = 0; i < 5; i++) {
+            try {
+                const parsed = new URL(current);
+                // URLSearchParams.get() already percent-decodes the value; no need for
+                // a second decodeURIComponent() call (that would corrupt %25-encoded chars).
+                const inner = parsed.searchParams.get('url');
+                if (!inner) break;
+                // Only unwrap if the inner value is itself a valid stream URL.
+                if (!isStreamURL(inner)) break;
+                current = inner;
+            } catch { break; /* malformed URL — stop iterating, return what we have */ }
+        }
+        return current;
+    }
+
     /** Creates the standard progress callback used by both startDownload and resumeDownload. */
     function _makeProgressCallback(dl) {
         return (bytes) => { dl.bytesWritten += bytes; updateUI(); _debouncedPersistDownloads(); };
     }
 
     async function startDownload(url) {
+        // Unwrap proxy URLs (e.g. /api/stream?url=<real-stream-url>) so we
+        // download from the actual stream endpoint rather than the proxy, which
+        // typically returns 403 when accessed directly.
+        url = resolveProxyURL(url);
+
         if (!downloadDirHandle) {
             alert('[Livestream Recorder] Please select a download directory first.');
             return;
