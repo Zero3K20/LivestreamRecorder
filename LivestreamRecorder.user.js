@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.22
+// @version      1.4.23
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -49,12 +49,22 @@
      */
     const MAX_WORKER_MSG_SCAN_CHARS = 200000;
 
+    /** GM storage key for the debug-mode flag. */
+    const DEBUG_GM_KEY = 'lsr_debug_mode';
+
     // When @grant directives are present, some userscript managers (Violentmonkey,
     // Greasemonkey on Firefox) run the script in a sandboxed context where `window`
     // is a proxy wrapper.  Replacing window.fetch or window.WebSocket on that proxy
     // only affects the sandbox — the real page code still calls the originals.
     // `unsafeWindow` is the real page window and must be used for all API hooks.
     const _win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+
+    /** When true, verbose diagnostic logs are written to console.debug. Toggle via the GM menu. */
+    let _debugMode = false;
+    try { _debugMode = !!GM_getValue(DEBUG_GM_KEY, false); } catch { /* ignore */ }
+
+    /** Emit a diagnostic log line when debug mode is enabled. */
+    const dbg = (...args) => { if (_debugMode) console.debug('[LivestreamRecorder]', ...args); };
 
     // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -491,6 +501,7 @@
         } catch { /* use full URL as fallback key */ }
 
         const preCapture = _preCaptures.get(tapKey);
+        dbg('tap: url=%s tapKey=%s preCapture=%s', url, tapKey, !!preCapture);
 
         if (preCapture) {
             // ── Mode A: use the player's already-active connection ──────────────────
@@ -498,6 +509,7 @@
             // Take ownership: stop the pre-capture's buffering and start forwarding
             // directly to the file.
             _preCaptures.delete(tapKey);
+            dbg('tap: Mode A — pre-capture buffer=%d bytes', preCapture.totalBytes);
 
             return new Promise((resolve, reject) => {
                 const tap = {
@@ -573,6 +585,7 @@
         }
 
         // ── Mode B: no pre-capture — wait for the player's next fetch/XHR ───────
+        dbg('tap: Mode B — waiting for next fetch/XHR tapKey=%s', tapKey);
         return new Promise((resolve, reject) => {
             const tap = {
                 writable,
@@ -628,6 +641,7 @@
      */
     async function downloadDirect(url, fileHandle, onProgress, stopSignal, opts = {}) {
         const { startOffset = 0 } = opts;
+        dbg('download url=%s startOffset=%d', url, startOffset);
         const writable = await fileHandle.createWritable({ keepExistingData: startOffset > 0 });
         if (startOffset > 0) await writable.seek(startOffset);
         const CHUNK = 4 * 1024 * 1024; // 4 MB per Range request
@@ -665,6 +679,7 @@
                 // `?url=http://…` into `?url=http%3A%2F%2F…` — fall back to the
                 // page's native fetch, which preserves the URL as-is.
                 try {
+                    dbg('download: trying GM fetch');
                     const r = await gmFetch(url, { responseType: 'arraybuffer' });
                     if (!stopSignal.stopped) {
                         await writable.write(r.response);
@@ -672,15 +687,20 @@
                     }
                 } catch (e) {
                     if (!e.isGmNetworkError && !e.isGmForbidden) throw e;
+                    dbg('download: GM fetch failed: %s', e.message);
                     // GM failed (network error or 403).  Try the page's native
                     // fetch next: it runs in the full browser context and sends
                     // the session cookies that GM omits.
                     let pageFetchSucceeded = false;
                     if (!stopSignal.stopped) {
                         try {
+                            dbg('download: trying page fetch url=%s', url);
                             await _downloadViaPageFetch(url, writable, onProgress, stopSignal);
                             pageFetchSucceeded = true;
-                        } catch { /* fall through to XHR tap */ }
+                            dbg('download: page fetch succeeded');
+                        } catch (pageFetchErr) {
+                            dbg('download: page fetch failed: %s', pageFetchErr && pageFetchErr.message);
+                        }
                     }
                     // If page fetch also returned 403 (server ties the stream to
                     // the player's session via a short-lived token — independent
@@ -696,13 +716,18 @@
                             const inner = new URL(url).searchParams.get('url');
                             if (inner && !stopSignal.stopped) {
                                 try {
+                                    dbg('download: trying inner URL=%s', inner);
                                     await _downloadViaPageFetch(inner, writable, onProgress, stopSignal);
                                     pageFetchSucceeded = true;
-                                } catch { /* fall through to tap */ }
+                                    dbg('download: inner URL page fetch succeeded');
+                                } catch (innerErr) {
+                                    dbg('download: inner URL page fetch failed: %s', innerErr && innerErr.message);
+                                }
                             }
                         } catch { /* URL parsing failed or no url= param — skip inner fallback */ }
                     }
                     if (!pageFetchSucceeded && !stopSignal.stopped) {
+                        dbg('download: trying tap for url=%s', url);
                         await _downloadViaTap(url, writable, onProgress, stopSignal);
                     }
                 }
@@ -998,7 +1023,10 @@
         // Suppress .ts segments that belong to a known HLS playlist directory.
         if (isTS) {
             const dir = getURLDirectory(url);
-            if (dir && detectedM3U8Prefixes.has(dir)) return;
+            if (dir && detectedM3U8Prefixes.has(dir)) {
+                dbg('detect: skip ts-segment %s', url);
+                return;
+            }
         }
 
         // Suppress inner URLs that are already wrapped by a detected proxy URL.
@@ -1007,7 +1035,10 @@
         // The response body scanner may detect the inner stream URL from an API
         // response before the proxy URL is detected via the worker postMessage hook.
         // Recording the inner URL directly would fail (403); only the proxy URL works.
-        if (_proxiedInnerURLs.has(url)) return;
+        if (_proxiedInnerURLs.has(url)) {
+            dbg('detect: skip proxied-inner %s', url);
+            return;
+        }
 
         if (!detectedStreams.has(url)) {
             // Replace a stale URL for the same streaming endpoint.
@@ -1054,6 +1085,7 @@
 
             if (mimeType) streamMimeTypes.set(url, mimeType);
             detectedStreams.add(url);
+            dbg('detect: +%s mime=%s', url, mimeType || '(none)');
             updateUI();
             _debouncedPersistStreams();
         }
@@ -1085,7 +1117,9 @@
         try {
             const full = resolveURL(location.href, String(url));
             this._lsrUrl = full;
-            if (isStreamURL(full)) addDetectedStream(full);
+            const _xm = isStreamURL(full);
+            dbg('xhr open url=%s matched=%s', full, _xm);
+            if (_xm) addDetectedStream(full);
         } catch { /* ignore */ }
         return _xhrOpen.call(this, method, url, ...rest);
     };
@@ -1100,7 +1134,10 @@
                     this.removeEventListener('readystatechange', onStateChange);
                     try {
                         const ct = this.getResponseHeader('Content-Type') || '';
-                        if (STREAM_MIME_RE.test(ct)) addDetectedStream(lsrUrl, ct);
+                        if (STREAM_MIME_RE.test(ct)) {
+                            dbg('xhr MIME url=%s ct=%s', lsrUrl, ct);
+                            addDetectedStream(lsrUrl, ct);
+                        }
                     } catch { /* cross-origin XHR may throw */ }
                 }
             };
@@ -1183,6 +1220,7 @@
                         onChunk: null, onDone: null, stopped: false,
                     };
                     _preCaptures.set(pcKey, capture);
+                    dbg('xhr preCapture start pcKey=%s', pcKey);
 
                     // Helper: convert a raw string (x-user-defined charset) to Uint8Array.
                     // charCodeAt preserves the raw byte value of each character (0-255).
@@ -1261,6 +1299,7 @@
         } catch { full = ''; }
         if (full) {
             const urlMatched = isStreamURL(full);
+            dbg('fetch url=%s urlMatched=%s', full, urlMatched);
             if (urlMatched) addDetectedStream(full);
             const promise = _fetch.call(this, input, ...rest);
 
@@ -1361,6 +1400,7 @@
                             if (capture.onDone) capture.onDone();
                         });
                     };
+                    dbg('fetch preCapture start pcKey=%s', pcKey);
                     pump();
                 }).catch(() => {});
             }
@@ -1375,6 +1415,7 @@
                         const ct = response.headers.get('content-type') || '';
                         if (STREAM_MIME_RE.test(ct)) {
                             addDetectedStream(full, ct);
+                            dbg('fetch MIME url=%s ct=%s', full, ct);
                             // Also start a pre-capture so that _downloadViaTap can tap
                             // into the player's current long-lived connection immediately
                             // (e.g. FLV.js on pc.mliveh5.com uses a proxy URL like
@@ -1396,6 +1437,7 @@
                                             onChunk: null, onDone: null, stopped: false,
                                         };
                                         _preCaptures.set(pcKey, capture);
+                                        dbg('fetch preCapture start pcKey=%s (MIME path)', pcKey);
                                         const pump = () => {
                                             reader.read().then(({ done, value }) => {
                                                 if (done || capture.stopped) {
@@ -1494,11 +1536,88 @@
                 if (data !== null && data !== undefined) {
                     const text = typeof data === 'string' ? data
                                : (typeof data === 'object' ? JSON.stringify(data) : null);
-                    if (text && text.length < MAX_WORKER_MSG_SCAN_CHARS) scanTextForStreamURLs(text);
+                    if (text && text.length < MAX_WORKER_MSG_SCAN_CHARS) {
+                        dbg('worker postMsg: scanning %d chars', text.length);
+                        scanTextForStreamURLs(text);
+                    }
                 }
             } catch { /* ignore hook errors */ }
             return _origWorkerPostMsg.apply(this, [data, ...rest]);
         };
+    }
+
+    // Hook Worker constructor — inject a stream-detection shim into blob: workers.
+    // When a player (e.g. FLV.js) runs its I/O inside a dedicated worker loaded from
+    // a blob: URL, the main-thread fetch and XHR hooks above never fire for those
+    // requests.  By prepending a tiny shim (via importScripts) to classic blob: workers
+    // we hook self.fetch inside the worker and relay detected stream URLs back to the
+    // main thread as { __lsr: 1, url, mime } postMessage events, where our listener
+    // calls addDetectedStream() so the stream appears in the UI.
+    const _OrigWorker = _win.Worker;
+    if (_OrigWorker && _win.URL && typeof _win.URL.createObjectURL === 'function'
+            && typeof _win.URL.revokeObjectURL === 'function') {
+        const _cou = _win.URL.createObjectURL.bind(_win.URL);
+        const _rou = _win.URL.revokeObjectURL.bind(_win.URL);
+
+        // Shim prepended to blob: workers.  Hooks self.fetch and posts
+        // { __lsr: 1, url, mime } back to the main thread when a streaming
+        // Content-Type is detected on a response.
+        const _WORKER_SHIM = `(function(){
+var _f=typeof self.fetch==="function"?self.fetch:null;if(!_f)return;
+self.fetch=function(input){
+var u=typeof input==="string"?input:(input&&input.url)||"";
+var p=_f.apply(this,arguments);
+if(u)p.then(function(r){try{
+var ct=(r.headers&&r.headers.get("content-type"))||"";
+if(/video\\/x-flv|video\\/mp2t|application\\/(x-mpegurl|vnd\\.apple\\.mpegurl)/i.test(ct)){
+self.postMessage({__lsr:1,url:u,mime:ct});
+}
+}catch(e){}}).catch(function(){});
+return p;
+};
+})();
+`;
+
+        _win.Worker = function (scriptURL, options) {
+            const isModule = options && options.type === 'module';
+            const src = scriptURL instanceof _win.URL ? scriptURL.href
+                      : typeof scriptURL === 'string' ? scriptURL : String(scriptURL);
+            let effectiveURL = src;
+            let shimURL = null;
+            // Only classic (non-module) workers support importScripts.
+            if (!isModule && typeof src === 'string' && src.startsWith('blob:')) {
+                try {
+                    const shimBlob = new Blob(
+                        [_WORKER_SHIM + 'importScripts(' + JSON.stringify(src) + ');'],
+                        { type: 'application/javascript' }
+                    );
+                    shimURL = _cou(shimBlob);
+                    effectiveURL = shimURL;
+                    dbg('worker create: injecting shim into blob worker %s', src);
+                } catch { /* fall through — use original URL */ }
+            }
+            const w = options !== undefined
+                ? new _OrigWorker(effectiveURL, options)
+                : new _OrigWorker(effectiveURL);
+            if (shimURL !== null) { try { _rou(shimURL); } catch { /* ignore */ } }
+            // Relay stream-detection messages from this worker to our main-thread state.
+            try {
+                w.addEventListener('message', function (e) {
+                    try {
+                        const d = e.data;
+                        if (d && d.__lsr === 1 && typeof d.url === 'string') {
+                            dbg('worker msg: stream detected url=%s mime=%s', d.url, d.mime || '');
+                            addDetectedStream(d.url, d.mime || undefined);
+                        }
+                    } catch { /* ignore */ }
+                });
+            } catch { /* ignore */ }
+            return w;
+        };
+        // Preserve prototype so that instanceof Worker checks work correctly.
+        try { _win.Worker.prototype = _OrigWorker.prototype; } catch (e) {
+            console.warn('[LivestreamRecorder] Worker prototype assignment failed:', e);
+        }
     }
 
     // Hook HTMLMediaElement.srcObject — detect WebRTC streams (RTCPeerConnection).
@@ -2132,6 +2251,13 @@
         } else {
             panel.style.display = panel.style.display === 'none' ? '' : 'none';
         }
+    });
+
+    GM_registerMenuCommand((_debugMode ? '✓' : '○') + ' Debug mode', () => {
+        _debugMode = !_debugMode;
+        try { GM_setValue(DEBUG_GM_KEY, _debugMode); } catch { /* ignore */ }
+        console.info('[LivestreamRecorder] Debug mode', _debugMode ? 'ENABLED' : 'DISABLED',
+            '— reload the page to apply to all hooks.');
     });
 
     // ─── Initialise ───────────────────────────────────────────────────────────────
