@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.20
+// @version      1.4.21
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -1135,8 +1135,13 @@
                         localOffset = res.byteLength;
                     } else if (typeof res === 'string') {
                         if (res.length <= localOffset) return;
-                        newBytes = new TextEncoder().encode(res.slice(localOffset)).buffer;
+                        const slice = res.slice(localOffset);
                         localOffset = res.length;
+                        // Use charCodeAt to preserve raw byte values for x-user-defined
+                        // charset (used by mpegts.js when streaming binary FLV data over XHR).
+                        const bytes = new Uint8Array(slice.length);
+                        for (let i = 0; i < slice.length; i++) bytes[i] = slice.charCodeAt(i) & 0xff;
+                        newBytes = bytes.buffer;
                     } else {
                         return; // blob / document / json — not raw binary stream data
                     }
@@ -1158,6 +1163,88 @@
                 // re-enters this hook, so we leave the tap registered and just
                 // flush any final bytes here.
                 this.addEventListener('load', flushChunk);
+            }
+
+            // XHR pre-capture: for detected stream URLs with no active tap, buffer
+            // incoming data in a rolling window so that _downloadViaTap Mode A can
+            // start writing immediately from the player's *current* connection.
+            // This is critical for long-lived streaming XHRs (e.g. mpegts.js live
+            // streams) that hold a single connection open for the entire broadcast
+            // without reconnecting — identical in purpose to the fetch pre-capture.
+            if (tapKey === null && isStreamURL(lsrUrl)) {
+                let pcKey;
+                try { const p = new URL(lsrUrl); pcKey = p.origin + p.pathname; }
+                catch { pcKey = lsrUrl; }
+                if (!_preCaptures.has(pcKey) && !_fetchTaps.has(pcKey) && !_xhrTaps.has(pcKey)) {
+                    const xhrRef = this;
+                    let pcOffset = 0;
+                    const capture = {
+                        buffer: [], totalBytes: 0,
+                        onChunk: null, onDone: null, stopped: false,
+                    };
+                    _preCaptures.set(pcKey, capture);
+
+                    // Helper: convert a raw string (x-user-defined charset) to Uint8Array.
+                    // charCodeAt preserves the raw byte value of each character (0-255).
+                    const strToBytes = (str) => {
+                        const b = new Uint8Array(str.length);
+                        for (let i = 0; i < str.length; i++) b[i] = str.charCodeAt(i) & 0xff;
+                        return b;
+                    };
+
+                    const pcFlush = function () {
+                        if (capture.stopped) return;
+                        let newBytes;
+                        try {
+                            const res = xhrRef.response;
+                            if (res instanceof ArrayBuffer && res.byteLength > pcOffset) {
+                                // arraybuffer: partial data available in Firefox; full
+                                // data available in Chrome only at load time.
+                                newBytes = new Uint8Array(res.slice(pcOffset));
+                                pcOffset = res.byteLength;
+                            } else if (typeof res === 'string' && res.length > pcOffset) {
+                                // text response (responseType '' or 'text') — used by
+                                // mpegts.js for live FLV streaming with x-user-defined charset.
+                                newBytes = strToBytes(res.slice(pcOffset));
+                                pcOffset = res.length;
+                            } else {
+                                // response not yet available (Chrome arraybuffer during progress)
+                                // — try responseText as fallback for streaming text responses.
+                                try {
+                                    const rt = xhrRef.responseText;
+                                    if (typeof rt === 'string' && rt.length > pcOffset) {
+                                        newBytes = strToBytes(rt.slice(pcOffset));
+                                        pcOffset = rt.length;
+                                    }
+                                } catch { return; }
+                            }
+                        } catch { return; }
+                        if (!newBytes || newBytes.byteLength === 0) return;
+                        if (capture.onChunk) {
+                            capture.onChunk(newBytes);
+                        } else {
+                            capture.buffer.push(newBytes);
+                            capture.totalBytes += newBytes.byteLength;
+                            while (capture.totalBytes > MAX_PRE_CAPTURE_BYTES && capture.buffer.length > 0) {
+                                capture.totalBytes -= capture.buffer.shift().byteLength;
+                            }
+                        }
+                    };
+
+                    const pcDone = function () {
+                        pcFlush(); // flush any final bytes before signalling done
+                        if (_preCaptures.get(pcKey) === capture) _preCaptures.delete(pcKey);
+                        if (capture.onDone) capture.onDone();
+                    };
+                    const pcError = function () {
+                        if (_preCaptures.get(pcKey) === capture) _preCaptures.delete(pcKey);
+                    };
+
+                    this.addEventListener('progress', pcFlush);
+                    this.addEventListener('load', pcDone);
+                    this.addEventListener('error', pcError);
+                    this.addEventListener('abort', pcError);
+                }
             }
         }
         return _xhrSend.apply(this, args);
