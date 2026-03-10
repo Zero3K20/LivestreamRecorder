@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.21
+// @version      1.4.22
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -1375,6 +1375,53 @@
                         const ct = response.headers.get('content-type') || '';
                         if (STREAM_MIME_RE.test(ct)) {
                             addDetectedStream(full, ct);
+                            // Also start a pre-capture so that _downloadViaTap can tap
+                            // into the player's current long-lived connection immediately
+                            // (e.g. FLV.js on pc.mliveh5.com uses a proxy URL like
+                            // /api/stream?url=<cdn> whose inner CDN path has no .flv
+                            // extension — the URL doesn't match isStreamURL(), but the
+                            // MIME type reveals it's a stream).  Our .then() fires before
+                            // the player's handler, so response.clone() still works here.
+                            if (!response.bodyUsed && response.body && fetchTapKey === null) {
+                                let pcKey;
+                                try { const p = new URL(full); pcKey = p.origin + p.pathname; }
+                                catch { pcKey = full; }
+                                if (!_preCaptures.has(pcKey) && !_fetchTaps.has(pcKey)) {
+                                    let clone;
+                                    try { clone = response.clone(); } catch { clone = null; }
+                                    if (clone && clone.body) {
+                                        const reader = clone.body.getReader();
+                                        const capture = {
+                                            reader, buffer: [], totalBytes: 0,
+                                            onChunk: null, onDone: null, stopped: false,
+                                        };
+                                        _preCaptures.set(pcKey, capture);
+                                        const pump = () => {
+                                            reader.read().then(({ done, value }) => {
+                                                if (done || capture.stopped) {
+                                                    _preCaptures.delete(pcKey);
+                                                    if (capture.onDone) capture.onDone();
+                                                    return;
+                                                }
+                                                if (capture.onChunk) {
+                                                    capture.onChunk(value);
+                                                } else {
+                                                    capture.buffer.push(value);
+                                                    capture.totalBytes += value.byteLength;
+                                                    while (capture.totalBytes > MAX_PRE_CAPTURE_BYTES && capture.buffer.length > 0) {
+                                                        capture.totalBytes -= capture.buffer.shift().byteLength;
+                                                    }
+                                                }
+                                                pump();
+                                            }).catch(() => {
+                                                _preCaptures.delete(pcKey);
+                                                if (capture.onDone) capture.onDone();
+                                            });
+                                        };
+                                        pump();
+                                    }
+                                }
+                            }
                         } else if (/^(text\/|application\/(json|x-ndjson|x-component|x-www-form-urlencoded))/i.test(ct)) {
                             const clone = response.clone();
                             clone.text().then(text => {
