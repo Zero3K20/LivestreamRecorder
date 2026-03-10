@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.15
+// @version      1.4.16
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -207,7 +207,13 @@
                     if (r.status >= 200 && r.status < 300) resolve(r);
                     else reject(new Error(`HTTP ${r.status} for ${url}`));
                 },
-                onerror(e) { reject(new Error(`Network error: ${JSON.stringify(e)}`)); },
+                onerror(e) {
+                    const err = new Error(`Network error: ${JSON.stringify(e)}`);
+                    // Flag network-level failures (status 0) so callers can distinguish
+                    // them from HTTP errors and apply fallback strategies.
+                    err.isGmNetworkError = true;
+                    reject(err);
+                },
                 ontimeout() { reject(new Error(`Timeout for ${url}`)); },
             });
         });
@@ -351,6 +357,50 @@
     // ─── Direct stream downloader (flv / mp4 / etc.) ─────────────────────────────
 
     /**
+     * Download a URL using the page's native `fetch` API (accessed via `_win.fetch`),
+     * reading the response as a `ReadableStream` and writing each chunk to disk as it
+     * arrives.
+     *
+     * This is used as a fallback when `GM_xmlhttpRequest` fails with a network error
+     * (status 0).  The most common cause is that Tampermonkey internally rebuilds
+     * URLs via `URLSearchParams`, which percent-encodes characters like `:` and `/`
+     * in query-parameter values — turning `?url=http://…` into `?url=http%3A%2F%2F…`.
+     * Proxy servers that do not URL-decode their parameters then receive an invalid
+     * inner URL and close the connection before sending any HTTP response.  The
+     * browser's native `fetch` uses the URL's `.href` representation (which preserves
+     * those characters) so the server receives the URL exactly as intended.
+     *
+     * Because this runs in the page context it is subject to CORS, but streaming
+     * proxy APIs that web players already access cross-origin typically allow it.
+     *
+     * @param {string} url
+     * @param {FileSystemWritableFileStream} writable  - already open, caller closes it
+     * @param {function(number): void} onProgress
+     * @param {{ stopped: boolean }} stopSignal
+     */
+    async function _downloadViaPageFetch(url, writable, onProgress, stopSignal) {
+        if (typeof _win.fetch !== 'function') throw new Error('Page fetch not available');
+        const response = await _win.fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
+        if (!response.body) throw new Error('Response body not available');
+
+        const reader = response.body.getReader();
+        try {
+            while (!stopSignal.stopped) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                await writable.write(value);
+                onProgress(value.byteLength);
+            }
+        } finally {
+            // cancel() tells the browser it can discard any buffered/upcoming data.
+            // Errors here (e.g. stream already closed) are harmless — the file write
+            // already completed (or was intentionally stopped), so we suppress them.
+            reader.cancel().catch(() => {});
+        }
+    }
+
+    /**
      * Download a direct stream URL in fixed-size chunks using HTTP Range requests,
      * writing each chunk to disk immediately to avoid buffering the whole file.
      * Falls back to a single-request download if the server does not support
@@ -395,12 +445,23 @@
                 }
             } else {
                 // Single GET (live push streams, servers without Range support).
-                // The entire response will be in memory until written — unavoidable without
-                // browser Streams API access from content scripts.
-                const r = await gmFetch(url, { responseType: 'arraybuffer' });
-                if (!stopSignal.stopped) {
-                    await writable.write(r.response);
-                    onProgress(r.response.byteLength);
+                // Try GM_xmlhttpRequest first.  If it fails with a network error
+                // (status 0) — which can happen when Tampermonkey re-encodes query
+                // parameters via URLSearchParams, corrupting URLs like
+                // `?url=http://…` into `?url=http%3A%2F%2F…` — fall back to the
+                // page's native fetch, which preserves the URL as-is.
+                try {
+                    const r = await gmFetch(url, { responseType: 'arraybuffer' });
+                    if (!stopSignal.stopped) {
+                        await writable.write(r.response);
+                        onProgress(r.response.byteLength);
+                    }
+                } catch (e) {
+                    if (!e.isGmNetworkError) throw e;
+                    // GM_xmlhttpRequest network error — fall back to page fetch.
+                    if (!stopSignal.stopped) {
+                        await _downloadViaPageFetch(url, writable, onProgress, stopSignal);
+                    }
                 }
             }
         } finally {
