@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.16
+// @version      1.4.17
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -205,7 +205,15 @@
                 headers: reqHeaders,
                 onload(r) {
                     if (r.status >= 200 && r.status < 300) resolve(r);
-                    else reject(new Error(`HTTP ${r.status} for ${url}`));
+                    else {
+                        const err = new Error(`HTTP ${r.status} for ${url}`);
+                        // Flag 403 responses so callers can apply the page-fetch
+                        // fallback — GM_xmlhttpRequest lacks the browser's cookie/
+                        // session context and auto-sent headers (Referer, Origin)
+                        // that streaming proxy servers often require.
+                        if (r.status === 403) err.isGmForbidden = true;
+                        reject(err);
+                    }
                 },
                 onerror(e) {
                     const err = new Error(`Network error: ${JSON.stringify(e)}`);
@@ -457,8 +465,12 @@
                         onProgress(r.response.byteLength);
                     }
                 } catch (e) {
-                    if (!e.isGmNetworkError) throw e;
-                    // GM_xmlhttpRequest network error — fall back to page fetch.
+                    if (!e.isGmNetworkError && !e.isGmForbidden) throw e;
+                    // GM_xmlhttpRequest network error or 403 — fall back to page fetch.
+                    // 403 typically means the proxy requires cookies/session context or
+                    // headers (Referer, Origin) that the browser sends automatically but
+                    // GM_xmlhttpRequest omits.  The page's native fetch runs in the full
+                    // browser context and includes those headers.
                     if (!stopSignal.stopped) {
                         await _downloadViaPageFetch(url, writable, onProgress, stopSignal);
                     }
