@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.23
+// @version      1.4.24
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        unsafeWindow
@@ -61,7 +62,7 @@
 
     /** When true, verbose diagnostic logs are written to console.debug. Toggle via the GM menu. */
     let _debugMode = false;
-    try { _debugMode = !!GM_getValue(DEBUG_GM_KEY, false); } catch { /* ignore */ }
+    try { _debugMode = GM_getValue(DEBUG_GM_KEY, '0') === '1'; } catch { /* ignore */ }
 
     /** Emit a diagnostic log line when debug mode is enabled. */
     const dbg = (...args) => { if (_debugMode) console.debug('[LivestreamRecorder]', ...args); };
@@ -2253,12 +2254,43 @@ return p;
         }
     });
 
-    GM_registerMenuCommand((_debugMode ? '✓' : '○') + ' Debug mode', () => {
-        _debugMode = !_debugMode;
-        try { GM_setValue(DEBUG_GM_KEY, _debugMode); } catch { /* ignore */ }
-        console.info('[LivestreamRecorder] Debug mode', _debugMode ? 'ENABLED' : 'DISABLED',
-            '— reload the page to apply to all hooks.');
-    });
+    // ─── Debug mode menu command ─────────────────────────────────────────────────
+    // Tampermonkey does not update a menu item's label automatically — we must
+    // unregister the old entry and re-register with the new label after each toggle.
+    // The command ID returned by GM_registerMenuCommand is used for that.
+    // GM_unregisterMenuCommand may be undefined in older userscript managers; we
+    // guard against that so the toggle still works (just without a live label update).
+
+    (function _setupDebugMenu() {
+        let _debugMenuId = null;
+        let _registering = false;
+
+        function _registerDebugMenu() {
+            if (_registering) return;
+            _registering = true;
+            try {
+                if (_debugMenuId !== null && typeof GM_unregisterMenuCommand === 'function') {
+                    try { GM_unregisterMenuCommand(_debugMenuId); } catch { /* ignore */ }
+                    _debugMenuId = null;
+                }
+                _debugMenuId = GM_registerMenuCommand(
+                    (_debugMode ? '✓' : '○') + ' Debug mode',
+                    () => {
+                        _debugMode = !_debugMode;
+                        try { GM_setValue(DEBUG_GM_KEY, _debugMode ? '1' : '0'); } catch { /* ignore */ }
+                        console.info('[LivestreamRecorder] Debug mode',
+                            _debugMode ? 'ENABLED' : 'DISABLED',
+                            '— reload the page to apply to all hooks.');
+                        // Re-register with the updated label so Tampermonkey reflects the new state.
+                        _registerDebugMenu();
+                    }
+                );
+            } catch { /* GM_registerMenuCommand not available */ }
+            _registering = false;
+        }
+
+        _registerDebugMenu();
+    })();
 
     // ─── Initialise ───────────────────────────────────────────────────────────────
 
