@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.17
+// @version      1.4.18
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -96,6 +96,16 @@
      * @type {Set<string>}
      */
     const _proxiedInnerURLs = new Set();
+
+    /**
+     * Active XHR recording taps: when both GM_xmlhttpRequest and page fetch
+     * return 403 (the server ties the stream to the player's session), we
+     * intercept the page player's own XHR instead of making a new request.
+     * Keyed by the URL's origin+pathname so token-refreshed reconnections are
+     * caught automatically.
+     * @type {Map<string, object>}
+     */
+    const _xhrTaps = new Map();
 
     /**
      * Stable identifier for this tab session.  sessionStorage retains the value
@@ -409,6 +419,62 @@
     }
 
     /**
+     * Download a stream by tapping into the page player's own XHR requests to
+     * the same URL endpoint.  Used as a last resort when both GM_xmlhttpRequest
+     * and the page fetch return 403 — which happens when the server binds the
+     * stream to the player's session via a short-lived token embedded in the
+     * URL: the player holds an open connection obtained while the token was
+     * fresh, but any new independent request using the (now-expired) token is
+     * rejected.
+     *
+     * Rather than making a new network request, this function registers a tap
+     * keyed by the URL's origin+pathname.  The _xhrSend hook then intercepts
+     * every subsequent XHR.send() call whose URL matches that key and forwards
+     * each incoming chunk to the file.  Because the player reconnects
+     * periodically (or immediately, for live streams), recording begins as soon
+     * as the next XHR to that endpoint fires.  This also handles automatic
+     * token rotation: when the player refreshes its token and reconnects with a
+     * new URL query string, the new XHR is intercepted too (same origin+path).
+     *
+     * @param {string} url
+     * @param {FileSystemWritableFileStream} writable  - already open, caller closes it
+     * @param {function(number): void} onProgress
+     * @param {{ stopped: boolean }} stopSignal
+     */
+    async function _downloadViaXHRTap(url, writable, onProgress, stopSignal) {
+        let tapKey = url;
+        try {
+            const p = new URL(url);
+            tapKey = p.origin + p.pathname;
+        } catch { /* use full URL as fallback key */ }
+
+        return new Promise((resolve, reject) => {
+            const tap = {
+                writable,
+                onProgress,
+                stopSignal,
+                resolve,
+                reject,
+                pendingWrite: Promise.resolve(),
+                _stopPoll: null,
+            };
+            _xhrTaps.set(tapKey, tap);
+
+            // Resolve promptly once the user clicks Stop.
+            const stopPoll = setInterval(() => {
+                if (stopSignal.stopped) {
+                    clearInterval(stopPoll);
+                    if (_xhrTaps.get(tapKey) === tap) _xhrTaps.delete(tapKey);
+                    tap.pendingWrite.then(resolve, reject);
+                }
+            }, 500);
+            // Store so the poll can be cancelled if the tap is torn down by a
+            // write error rather than by the user stopping the recording.
+            tap._stopPoll = stopPoll;
+        });
+    }
+
+    /**
      * Download a direct stream URL in fixed-size chunks using HTTP Range requests,
      * writing each chunk to disk immediately to avoid buffering the whole file.
      * Falls back to a single-request download if the server does not support
@@ -466,13 +532,22 @@
                     }
                 } catch (e) {
                     if (!e.isGmNetworkError && !e.isGmForbidden) throw e;
-                    // GM_xmlhttpRequest network error or 403 — fall back to page fetch.
-                    // 403 typically means the proxy requires cookies/session context or
-                    // headers (Referer, Origin) that the browser sends automatically but
-                    // GM_xmlhttpRequest omits.  The page's native fetch runs in the full
-                    // browser context and includes those headers.
+                    // GM failed (network error or 403).  Try the page's native
+                    // fetch next: it runs in the full browser context and sends
+                    // the session cookies that GM omits.
+                    let pageFetchSucceeded = false;
                     if (!stopSignal.stopped) {
-                        await _downloadViaPageFetch(url, writable, onProgress, stopSignal);
+                        try {
+                            await _downloadViaPageFetch(url, writable, onProgress, stopSignal);
+                            pageFetchSucceeded = true;
+                        } catch { /* fall through to XHR tap */ }
+                    }
+                    // If page fetch also returned 403 (server ties the stream to
+                    // the player's session via a short-lived token — independent
+                    // requests are rejected even from the page context), tap into
+                    // the page player's own XHR instead of making a new request.
+                    if (!pageFetchSucceeded && !stopSignal.stopped) {
+                        await _downloadViaXHRTap(url, writable, onProgress, stopSignal);
                     }
                 }
             }
@@ -779,6 +854,34 @@
         if (_proxiedInnerURLs.has(url)) return;
 
         if (!detectedStreams.has(url)) {
+            // Replace a stale URL for the same streaming endpoint.
+            // Streaming services often embed a short-lived token in the URL query
+            // string (e.g. ?url=http://…/stream?token=<ts>).  When the page player
+            // refreshes its token and requests a new URL with the same
+            // origin+pathname but a different query string, we replace the old entry
+            // so that clicking Record always uses the freshest token.
+            try {
+                const { origin, pathname } = new URL(url);
+                const incomingBase = origin + pathname;
+                for (const existing of detectedStreams) {
+                    try {
+                        const ex = new URL(existing);
+                        if (ex.origin + ex.pathname === incomingBase) {
+                            // Same endpoint, different query → replace with fresher URL.
+                            detectedStreams.delete(existing);
+                            streamMimeTypes.delete(existing);
+                            // Also clean up the proxied-inner-URL tracking for the old
+                            // entry so the replaced URL does not stay suppressed.
+                            try {
+                                const oldInner = ex.searchParams.get('url');
+                                if (oldInner) _proxiedInnerURLs.delete(oldInner);
+                            } catch { /* ignore */ }
+                            break;
+                        }
+                    } catch { /* ignore malformed existing URL */ }
+                }
+            } catch { /* ignore malformed incoming URL */ }
+
             // If this URL is a proxy wrapper with a `url=<inner>` parameter, record
             // the inner URL as superseded and remove it from the detected set if it
             // was added earlier (inner URL detected before proxy URL).
@@ -846,6 +949,60 @@
                 }
             };
             this.addEventListener('readystatechange', onStateChange);
+
+            // XHR tap: intercept this request's data for an active recording.
+            // The tap key is the URL's origin+pathname so that reconnections
+            // with a refreshed token (different query string) are caught too.
+            let tapKey = null;
+            try {
+                const p = new URL(lsrUrl);
+                const epKey = p.origin + p.pathname;
+                if (_xhrTaps.has(lsrUrl)) tapKey = lsrUrl;
+                else if (_xhrTaps.has(epKey)) tapKey = epKey;
+            } catch { if (_xhrTaps.has(lsrUrl)) tapKey = lsrUrl; }
+
+            if (tapKey !== null) {
+                const tap = _xhrTaps.get(tapKey);
+                const xhr = this;
+                let localOffset = 0;
+
+                const flushChunk = function () {
+                    if (tap.stopSignal.stopped) return;
+                    const res = xhr.response;
+                    if (!res) return;
+                    let newBytes;
+                    if (res instanceof ArrayBuffer) {
+                        if (res.byteLength <= localOffset) return;
+                        newBytes = res.slice(localOffset);
+                        localOffset = res.byteLength;
+                    } else if (typeof res === 'string') {
+                        if (res.length <= localOffset) return;
+                        newBytes = new TextEncoder().encode(res.slice(localOffset)).buffer;
+                        localOffset = res.length;
+                    } else {
+                        return; // blob / document / json — not raw binary stream data
+                    }
+                    if (!newBytes || newBytes.byteLength === 0) return;
+                    const chunk = newBytes;
+                    tap.pendingWrite = tap.pendingWrite
+                        .then(() => tap.writable.write(chunk))
+                        .then(() => tap.onProgress(chunk.byteLength))
+                        .catch((err) => {
+                            console.warn('[LivestreamRecorder] XHR tap write error:', err);
+                            // Tear down the tap so the file handle can be released.
+                            if (tap._stopPoll) clearInterval(tap._stopPoll);
+                            if (_xhrTaps.get(tapKey) === tap) _xhrTaps.delete(tapKey);
+                            tap.reject(err);
+                        });
+                };
+
+                this.addEventListener('progress', flushChunk);
+                // 'load' fires when this XHR ends (server closed connection).
+                // Live-stream players reconnect immediately with a new XHR that
+                // re-enters this hook, so we leave the tap registered and just
+                // flush any final bytes here.
+                this.addEventListener('load', flushChunk);
+            }
         }
         return _xhrSend.apply(this, args);
     };
