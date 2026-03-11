@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.25
+// @version      1.4.26
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -1175,8 +1175,10 @@
             const full = resolveURL(location.href, String(url));
             this._lsrUrl = full;
             const _xm = isStreamURL(full);
-            dbg('xhr open url=%s matched=%s', full, _xm);
-            if (_xm) addDetectedStream(full);
+            if (_xm) {
+                dbg('xhr open url=%s matched=%s', full, _xm);
+                addDetectedStream(full);
+            }
         } catch { /* ignore */ }
         return _xhrOpen.call(this, method, url, ...rest);
     };
@@ -1356,8 +1358,10 @@
         } catch { full = ''; }
         if (full) {
             const urlMatched = isStreamURL(full);
-            dbg('fetch url=%s urlMatched=%s', full, urlMatched);
-            if (urlMatched) addDetectedStream(full);
+            if (urlMatched) {
+                dbg('fetch url=%s urlMatched=%s', full, urlMatched);
+                addDetectedStream(full);
+            }
             const promise = _fetch.call(this, input, ...rest);
 
             // Fetch tap: if a recording tap is waiting for this URL endpoint,
