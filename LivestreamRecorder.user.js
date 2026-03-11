@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.27
+// @version      1.4.28
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -198,10 +198,11 @@
     const _preCaptures = new Map();
 
     /**
-     * Maps worker capture IDs (numeric, assigned by the worker shim) to the
-     * pcKey (origin+pathname) stored in _preCaptures.  Used to route incoming
-     * chunk/end messages from blob workers to the correct pre-capture entry.
-     * @type {Map<number, string>}
+     * Maps worker capture IDs (numeric, assigned by the worker shim) to a
+     * `{ capture, pcKey }` pair.  Stores the capture object directly so that
+     * `wchunk`/`wend` message handlers can forward data even after Mode A has
+     * removed the entry from _preCaptures (via _preCaptures.delete).
+     * @type {Map<number, {capture: object, pcKey: string}>}
      */
     const _workerCaptures = new Map();
 
@@ -1720,17 +1721,19 @@ return p;
                                 onChunk: null, onDone: null, stopped: false,
                             };
                             _preCaptures.set(pcKey, capture);
-                            _workerCaptures.set(d.id, pcKey);
+                            // Store capture object directly so wchunk/wend still work after
+                            // Mode A removes the entry from _preCaptures.
+                            _workerCaptures.set(d.id, { capture, pcKey });
                             dbg('worker preCapture start pcKey=%s id=%d', pcKey, d.id);
                             return;
                         }
 
                         // Pre-capture chunk: forward to the rolling buffer (or live tap).
                         if (d.cmd === 'wchunk' && d.data instanceof Uint8Array) {
-                            const pcKey = _workerCaptures.get(d.id);
-                            if (!pcKey) return;
-                            const capture = _preCaptures.get(pcKey);
-                            if (!capture || capture.stopped) return;
+                            const wc = _workerCaptures.get(d.id);
+                            if (!wc) return;
+                            const { capture } = wc;
+                            if (capture.stopped) return;
                             const chunk = d.data;
                             if (capture.onChunk) {
                                 capture.onChunk(chunk);
@@ -1746,12 +1749,13 @@ return p;
 
                         // Pre-capture end: connection closed by server or player.
                         if (d.cmd === 'wend') {
-                            const pcKey = _workerCaptures.get(d.id);
+                            const wc = _workerCaptures.get(d.id);
                             _workerCaptures.delete(d.id);
-                            if (!pcKey) return;
-                            const capture = _preCaptures.get(pcKey);
-                            if (!capture) return;
-                            _preCaptures.delete(pcKey);
+                            if (!wc) return;
+                            const { capture, pcKey } = wc;
+                            // Remove from _preCaptures only if it's still our entry
+                            // (Mode A may have already removed it).
+                            if (_preCaptures.get(pcKey) === capture) _preCaptures.delete(pcKey);
                             if (capture.onDone) capture.onDone();
                             dbg('worker preCapture end pcKey=%s id=%d', pcKey, d.id);
                             return;
