@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.26
+// @version      1.4.27
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -191,9 +191,19 @@
      * reconnect.  This is critical for long-lived FLV push streams where the
      * player opens a single HTTP connection at page load and keeps it open for
      * minutes or hours without reconnecting.
-     * @type {Map<string, {reader: ReadableStreamDefaultReader, buffer: Uint8Array[], totalBytes: number, onChunk: Function|null, onDone: Function|null, stopped: boolean}>}
+     * @type {Map<string, {reader: ReadableStreamDefaultReader|null, buffer: Uint8Array[], totalBytes: number, onChunk: Function|null, onDone: Function|null, stopped: boolean}>}
+     * @remarks The `reader` field is `null` for captures driven by blob worker postMessage relay
+     *          (created via the `wstart` message protocol) rather than a main-thread ReadableStream.
      */
     const _preCaptures = new Map();
+
+    /**
+     * Maps worker capture IDs (numeric, assigned by the worker shim) to the
+     * pcKey (origin+pathname) stored in _preCaptures.  Used to route incoming
+     * chunk/end messages from blob workers to the correct pre-capture entry.
+     * @type {Map<number, string>}
+     */
+    const _workerCaptures = new Map();
 
     /** Maximum bytes held per pre-capture rolling window (8 MB). */
     const MAX_PRE_CAPTURE_BYTES = 8 * 1024 * 1024;
@@ -1620,11 +1630,21 @@
         const _cou = _win.URL.createObjectURL.bind(_win.URL);
         const _rou = _win.URL.revokeObjectURL.bind(_win.URL);
 
-        // Shim prepended to blob: workers.  Hooks self.fetch and posts
-        // { __lsr: 1, url, mime } back to the main thread when a streaming
-        // Content-Type is detected on a response.
+        // Shim prepended to blob: workers.  Hooks self.fetch and posts messages
+        // back to the main thread when a streaming Content-Type is detected.
+        // In addition to the detection message ({ __lsr:1, url, mime }), the shim
+        // also clones the response body and relays chunks via transferable
+        // ArrayBuffers so that _downloadViaTap can use Mode A (pre-capture) even
+        // when the player's HTTP request was issued from inside a blob worker
+        // (e.g. FLV.js on pc.mliveh5.com) where the main-thread fetch hook never
+        // fires.  Message protocol:
+        //   { __lsr:1, url, mime }              – stream detected (existing)
+        //   { __lsr:1, cmd:"wstart", url, id }  – pre-capture starting (id = unique int)
+        //   { __lsr:1, cmd:"wchunk", id, data } – Uint8Array chunk (transferable)
+        //   { __lsr:1, cmd:"wend",   id }        – stream connection closed
         const _WORKER_SHIM = `(function(){
 var _f=typeof self.fetch==="function"?self.fetch:null;if(!_f)return;
+var _id=0;
 self.fetch=function(input){
 var u=typeof input==="string"?input:(input&&input.url)||"";
 var p=_f.apply(this,arguments);
@@ -1632,6 +1652,15 @@ if(u)p.then(function(r){try{
 var ct=(r.headers&&r.headers.get("content-type"))||"";
 if(/video\\/x-flv|video\\/mp2t|application\\/(x-mpegurl|vnd\\.apple\\.mpegurl)/i.test(ct)){
 self.postMessage({__lsr:1,url:u,mime:ct});
+if(!r.bodyUsed&&r.body){var cl;try{cl=r.clone();}catch(e){return;}
+if(!cl||!cl.body)return;
+var id=++_id;
+var rdr=cl.body.getReader();
+self.postMessage({__lsr:1,cmd:"wstart",url:u,id:id});
+(function pump(){rdr.read().then(function(x){
+if(x.done){self.postMessage({__lsr:1,cmd:"wend",id:id});return;}
+self.postMessage({__lsr:1,cmd:"wchunk",id:id,data:x.value},[x.value.buffer]);
+pump();}).catch(function(){self.postMessage({__lsr:1,cmd:"wend",id:id});});})();}
 }
 }catch(e){}}).catch(function(){});
 return p;
@@ -1666,9 +1695,66 @@ return p;
                 w.addEventListener('message', function (e) {
                     try {
                         const d = e.data;
-                        if (d && d.__lsr === 1 && typeof d.url === 'string') {
+                        if (!d || d.__lsr !== 1) return;
+
+                        // Original detection message: stream URL + MIME type.
+                        if (typeof d.url === 'string' && !d.cmd) {
                             dbg('worker msg: stream detected url=%s mime=%s', d.url, d.mime || '');
                             addDetectedStream(d.url, d.mime || undefined);
+                            return;
+                        }
+
+                        // Pre-capture start: worker is about to relay stream body chunks.
+                        if (d.cmd === 'wstart' && typeof d.url === 'string') {
+                            let pcKey;
+                            try { const p = new URL(d.url); pcKey = p.origin + p.pathname; }
+                            catch { pcKey = d.url; }
+                            // If a tap is already active or a pre-capture exists, skip.
+                            if (_fetchTaps.has(pcKey) || _xhrTaps.has(pcKey) || _preCaptures.has(pcKey)) {
+                                // Stale capture ID — don't track it.
+                                return;
+                            }
+                            const capture = {
+                                reader: null, // not a ReadableStream reader; driven by postMessage
+                                buffer: [], totalBytes: 0,
+                                onChunk: null, onDone: null, stopped: false,
+                            };
+                            _preCaptures.set(pcKey, capture);
+                            _workerCaptures.set(d.id, pcKey);
+                            dbg('worker preCapture start pcKey=%s id=%d', pcKey, d.id);
+                            return;
+                        }
+
+                        // Pre-capture chunk: forward to the rolling buffer (or live tap).
+                        if (d.cmd === 'wchunk' && d.data instanceof Uint8Array) {
+                            const pcKey = _workerCaptures.get(d.id);
+                            if (!pcKey) return;
+                            const capture = _preCaptures.get(pcKey);
+                            if (!capture || capture.stopped) return;
+                            const chunk = d.data;
+                            if (capture.onChunk) {
+                                capture.onChunk(chunk);
+                            } else {
+                                capture.buffer.push(chunk);
+                                capture.totalBytes += chunk.byteLength;
+                                while (capture.totalBytes > MAX_PRE_CAPTURE_BYTES && capture.buffer.length > 0) {
+                                    capture.totalBytes -= capture.buffer.shift().byteLength;
+                                }
+                            }
+                            return;
+                        }
+
+                        // Pre-capture end: connection closed by server or player.
+                        if (d.cmd === 'wend') {
+                            const pcKey = _workerCaptures.get(d.id);
+                            _workerCaptures.delete(d.id);
+                            if (!pcKey) return;
+                            const capture = _preCaptures.get(pcKey);
+                            if (!capture) return;
+                            _preCaptures.delete(pcKey);
+                            if (capture.onDone) capture.onDone();
+                            dbg('worker preCapture end pcKey=%s id=%d', pcKey, d.id);
+                            return;
                         }
                     } catch { /* ignore */ }
                 });
