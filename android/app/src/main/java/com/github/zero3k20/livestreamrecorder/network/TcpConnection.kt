@@ -114,8 +114,12 @@ class TcpConnection(
     }
 
     private suspend fun handleClientData(payload: ByteArray, seqNum: Long) {
-        // Simplified: accept only in-order segments; ignore duplicates / retransmits.
-        if (seqNum != nextClientSeq) return
+        // Simplified: accept only in-order segments; ignore out-of-order / retransmits.
+        // Still send an ACK so the sender knows what we expect next and does not stall.
+        if (seqNum != nextClientSeq) {
+            sendControl(PacketParser.TCP_ACK, nextOurSeq)
+            return
+        }
         nextClientSeq = (nextClientSeq + payload.size) and 0xFFFF_FFFFL
 
         // Inspect the very first data chunk for stream-URL signals.

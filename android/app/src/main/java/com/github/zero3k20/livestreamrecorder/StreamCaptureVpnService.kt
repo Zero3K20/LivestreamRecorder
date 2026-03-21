@@ -153,10 +153,12 @@ class StreamCaptureVpnService : VpnService() {
                 if (len <= 0) continue
                 val pkt = buf.copyOf(len)
                 if (PacketParser.ipVersion(pkt) != 4) continue
-                when (PacketParser.ipProto(pkt)) {
-                    PacketParser.PROTO_TCP -> tcpProxy?.handlePacket(pkt)
-                    PacketParser.PROTO_UDP -> scope.launch { forwardUdp(pkt) }
-                }
+                try {
+                    when (PacketParser.ipProto(pkt)) {
+                        PacketParser.PROTO_TCP -> tcpProxy?.handlePacket(pkt)
+                        PacketParser.PROTO_UDP -> scope.launch { forwardUdp(pkt) }
+                    }
+                } catch (_: Exception) { /* skip malformed packet; keep loop alive */ }
             }
         } catch (_: Exception) { /* TUN fd closed on stopVpn() */ }
     }
