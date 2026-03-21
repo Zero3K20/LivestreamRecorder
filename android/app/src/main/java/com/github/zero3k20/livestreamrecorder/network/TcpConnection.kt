@@ -2,6 +2,7 @@ package com.github.zero3k20.livestreamrecorder.network
 
 import android.net.VpnService
 import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -9,6 +10,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.io.InputStream
@@ -51,14 +54,23 @@ class TcpConnection(
     private enum class State { SYN_RCVD, CONNECTING, ESTABLISHED, FIN_WAIT, CLOSED }
 
     // 32-bit sequence numbers; masking to 0xFFFF_FFFFL keeps them unsigned.
-    private val ourISN: Long       = (System.nanoTime() ushr 8) and 0xFFFF_FFFFL
-    private var nextClientSeq: Long = (clientISN + 1) and 0xFFFF_FFFFL
-    private var nextOurSeq:    Long = (ourISN + 1)    and 0xFFFF_FFFFL
+    private val ourISN: Long            = (System.nanoTime() ushr 8) and 0xFFFF_FFFFL
+    @Volatile private var nextClientSeq: Long = (clientISN + 1) and 0xFFFF_FFFFL
+    @Volatile private var nextOurSeq:    Long = (ourISN + 1)    and 0xFFFF_FFFFL
 
     @Volatile private var state = State.SYN_RCVD
 
     private val scope           = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val incomingChannel = Channel<ByteArray>(Channel.UNLIMITED)
+
+    /**
+     * Guards [state] and [pendingToServer] so that the state transition from
+     * CONNECTING → ESTABLISHED in [connectToRealDest] and the buffer-or-forward
+     * decision in [handleClientData] are atomic.  Without this mutex the two
+     * coroutines can race: [connectToRealDest] flushes and clears the buffer
+     * just as [handleClientData] adds a new item, permanently losing that data.
+     */
+    private val pendingMutex    = Mutex()
 
     /** Payload bytes received before the real socket is ready — flushed on ESTABLISHED. */
     private val pendingToServer = ArrayDeque<ByteArray>()
@@ -138,11 +150,19 @@ class TcpConnection(
         // ACK the data.
         sendControl(PacketParser.TCP_ACK, nextOurSeq)
 
-        if (state != State.ESTABLISHED) {
-            pendingToServer.addLast(payload)
-            return
+        // Decide atomically whether to buffer or forward directly.
+        // The mutex prevents a race where connectToRealDest() flushes and clears
+        // pendingToServer just as we are about to addLast(), which would cause the
+        // payload to be permanently stuck in the buffer and never reach the server.
+        val forwardDirectly = pendingMutex.withLock {
+            if (state != State.ESTABLISHED) {
+                pendingToServer.addLast(payload)
+                false
+            } else {
+                true
+            }
         }
-        forwardToServer(payload)
+        if (forwardDirectly) forwardToServer(payload)
     }
 
     private suspend fun handleClientFin() {
@@ -170,15 +190,20 @@ class TcpConnection(
             realSocket = sock
             realIn     = sock.getInputStream()
             realOut    = sock.getOutputStream()
-            state      = State.ESTABLISHED
 
-            // Flush any data that arrived before we finished connecting.
-            for (buffered in pendingToServer) forwardToServer(buffered)
-            pendingToServer.clear()
+            // Atomically transition to ESTABLISHED and flush any data that arrived
+            // while we were connecting.  The mutex ensures handleClientData() cannot
+            // slip a new item into pendingToServer between our flush and our clear.
+            pendingMutex.withLock {
+                state = State.ESTABLISHED
+                for (buffered in pendingToServer) forwardToServer(buffered)
+                pendingToServer.clear()
+            }
 
             // Start server→client relay.
             scope.launch { relayServerToClient() }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             sendControl(PacketParser.TCP_RST, nextOurSeq)
             close()
         }
@@ -213,7 +238,10 @@ class TcpConnection(
                 tunWrite(pkt)
                 nextOurSeq = (nextOurSeq + n) and 0xFFFF_FFFFL
             }
-        } catch (_: Exception) { /* socket closed */ }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            /* non-cancellation exception means socket closed; fall through to FIN */
+        }
 
         if (state == State.ESTABLISHED) {
             sendControl(PacketParser.TCP_FIN or PacketParser.TCP_ACK, nextOurSeq)
