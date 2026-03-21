@@ -114,6 +114,44 @@ ffmpeg -i recording.ts -c copy output.mp4
 
 ---
 
+## Android App
+
+An Android application that provides the same stream-detection and recording capabilities as the userscript, packaged as a native app with a built-in WebView browser.
+
+### How it works
+
+1. The app opens a WebView browser. You navigate to any page that plays a live stream.
+2. On every page load, `stream_hooks.js` is injected into the WebView — using the same XHR / `fetch` / `WebSocket` / `srcObject` hooks as the Chrome extension's content script.
+3. When a stream URL is detected, it is forwarded to the native Android layer via a `JavascriptInterface` bridge and added to the **Detected Streams** panel.
+4. Tap **↓ Record** to start downloading. HLS streams are recorded by polling the `.m3u8` playlist and concatenating MPEG-TS segments; all other streams are downloaded progressively. Files are written directly to disk — no in-memory buffering.
+5. Tap **■ Stop** to end a recording at any time.
+
+### Features
+
+- Built-in browser with address bar and back/forward/refresh navigation
+- Automatic stream detection: HLS/m3u8, FLV, MP4, MPEG-TS, WebSocket binary streams, WebRTC
+- Manual URL entry (`+ URL` button in the stream panel)
+- Real-time download progress (bytes written, segment count for HLS)
+- Recordings saved to `Android/data/com.github.zero3k20.livestreamrecorder/files/LivestreamRecorder/`
+- Min Android version: **8.0 (API 26)**
+
+### Building
+
+1. Install [Android Studio](https://developer.android.com/studio) (Hedgehog or later recommended).
+2. Open the `android/` folder as a project in Android Studio.
+3. Let Gradle sync complete (it will download the Gradle wrapper automatically).
+4. Connect a device or start an emulator, then click **▶ Run**.
+
+Or from the command line (after Android Studio has set up the Gradle wrapper):
+
+```bash
+cd android
+./gradlew assembleDebug
+# APK: android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+---
+
 ## Privacy & security
 
 - The extension uses `host_permissions: <all_urls>` so its service worker can fetch streams from any origin without CORS restrictions. No data is sent to any third-party server; all requests go directly to the stream's origin.

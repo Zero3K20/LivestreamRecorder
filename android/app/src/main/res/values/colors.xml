@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Brand / primary -->
+    <color name="colorPrimary">#FF6200EE</color>
+    <color name="colorPrimaryVariant">#FF3700B3</color>
+    <color name="colorOnPrimary">#FFFFFFFF</color>
+
+    <!-- Surface -->
+    <color name="colorSurface">#FFFFFFFF</color>
+
+    <!-- Stream-type badge colours -->
+    <color name="badge_hls">#FF6200EE</color>
+    <color name="badge_flv">#FFE65100</color>
+    <color name="badge_mp4">#FF1B5E20</color>
+    <color name="badge_webm">#FF0D47A1</color>
+    <color name="badge_ws">#FF880E4F</color>
+    <color name="badge_direct">#FF37474F</color>
+
+    <!-- Status text colours -->
+    <color name="status_success">#FF2E7D32</color>
+    <color name="status_error">#FFB71C1C</color>
+    <color name="status_neutral">#FF455A64</color>
+
+    <!-- Misc -->
+    <color name="handle_color">#FFCCCCCC</color>
+    <color name="url_bar_bg">#FFFAFAFA</color>
+</resources>

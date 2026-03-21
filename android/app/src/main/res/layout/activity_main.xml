@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Root: CoordinatorLayout so the BottomSheetBehavior can slide over the WebView.
+-->
+<androidx.coordinatorlayout.widget.CoordinatorLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    tools:context=".MainActivity">
+
+    <!-- ── Main content column ──────────────────────────────────────────────── -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <!-- Navigation bar: back, forward, URL field, refresh, stream-toggle -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:background="@color/colorPrimary"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingHorizontal="4dp">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnBack"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:contentDescription="@string/back"
+                android:minWidth="0dp"
+                android:padding="0dp"
+                android:text="‹"
+                android:textColor="@color/colorOnPrimary"
+                android:textSize="22sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnForward"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:contentDescription="@string/forward"
+                android:minWidth="0dp"
+                android:padding="0dp"
+                android:text="›"
+                android:textColor="@color/colorOnPrimary"
+                android:textSize="22sp" />
+
+            <EditText
+                android:id="@+id/urlBar"
+                android:layout_width="0dp"
+                android:layout_height="36dp"
+                android:layout_weight="1"
+                android:background="@drawable/url_bar_background"
+                android:hint="@string/url_hint"
+                android:imeOptions="actionGo"
+                android:inputType="textUri"
+                android:paddingHorizontal="12dp"
+                android:paddingVertical="4dp"
+                android:singleLine="true"
+                android:textColor="#FF212121"
+                android:textColorHint="#88212121"
+                android:textSize="13sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnRefresh"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:contentDescription="@string/refresh"
+                android:minWidth="0dp"
+                android:padding="0dp"
+                android:text="↻"
+                android:textColor="@color/colorOnPrimary"
+                android:textSize="20sp" />
+
+            <!-- Stream panel toggle; shows detected-stream count as a suffix -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnShowStreams"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:contentDescription="@string/show_streams"
+                android:minWidth="0dp"
+                android:padding="4dp"
+                android:text="⏺"
+                android:textColor="@color/colorOnPrimary"
+                android:textSize="14sp" />
+
+        </LinearLayout>
+
+        <!-- Page-load progress indicator -->
+        <ProgressBar
+            android:id="@+id/loadingBar"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="3dp"
+            android:max="100"
+            android:progressTint="@color/colorPrimary"
+            android:visibility="gone" />
+
+        <!-- WebView fills remaining space -->
+        <WebView
+            android:id="@+id/webView"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+
+    </LinearLayout>
+
+    <!-- ── Bottom sheet — detected streams panel ─────────────────────────────── -->
+    <LinearLayout
+        android:id="@+id/bottomSheet"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/colorSurface"
+        android:elevation="8dp"
+        android:orientation="vertical"
+        app:behavior_hideable="true"
+        app:behavior_peekHeight="0dp"
+        app:layout_behavior="com.google.android.material.bottomsheet.BottomSheetBehavior">
+
+        <!-- Drag handle -->
+        <View
+            android:layout_width="32dp"
+            android:layout_height="4dp"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginBottom="4dp"
+            android:layout_marginTop="8dp"
+            android:background="@color/handle_color" />
+
+        <!-- Header row: title + action buttons -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingHorizontal="16dp"
+            android:paddingVertical="8dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/detected_streams"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnAddManual"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/add_url" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnClearStreams"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/clear" />
+
+        </LinearLayout>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="?attr/colorOutline" />
+
+        <!-- Placeholder shown when no streams have been detected -->
+        <TextView
+            android:id="@+id/tvNoStreams"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:padding="32dp"
+            android:text="@string/no_streams_detected"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:visibility="visible" />
+
+        <!-- List of detected stream entries -->
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/recyclerStreams"
+            android:layout_width="match_parent"
+            android:layout_height="420dp"
+            android:clipToPadding="false"
+            android:overScrollMode="never"
+            android:padding="8dp" />
+
+    </LinearLayout>
+
+</androidx.coordinatorlayout.widget.CoordinatorLayout>
