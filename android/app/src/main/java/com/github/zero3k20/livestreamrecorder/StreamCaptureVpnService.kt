@@ -147,7 +147,7 @@ class StreamCaptureVpnService : VpnService() {
     private suspend fun packetLoop() {
         val buf = ByteArray(32_767)
         try {
-            while (isActive) {
+            while (coroutineContext.isActive) {
                 val len = tunIn?.read(buf) ?: break
                 if (len <= 0) continue
                 val pkt = buf.copyOf(len)

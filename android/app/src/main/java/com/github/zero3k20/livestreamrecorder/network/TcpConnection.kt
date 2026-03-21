@@ -193,7 +193,7 @@ class TcpConnection(
     private suspend fun relayServerToClient() {
         val buf = ByteArray(4_096)
         try {
-            while (isActive && state == State.ESTABLISHED) {
+            while (coroutineContext.isActive && state == State.ESTABLISHED) {
                 val n = withContext(Dispatchers.IO) { realIn?.read(buf) ?: -1 }
                 if (n < 0) break
                 val chunk = buf.copyOf(n)
