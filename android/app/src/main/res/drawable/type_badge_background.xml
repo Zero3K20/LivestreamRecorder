@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Background for stream-type badge labels -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <solid android:color="@color/badge_direct" />
+    <corners android:radius="4dp" />
+</shape>
