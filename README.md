@@ -116,23 +116,43 @@ ffmpeg -i recording.ts -c copy output.mp4
 
 ## Android App
 
-An Android application that provides the same stream-detection and recording capabilities as the userscript, packaged as a native app with a built-in WebView browser.
+An Android application that detects and records live streams played in **any app** on the device — not just a built-in browser.
 
 ### How it works
 
-1. The app opens a WebView browser. You navigate to any page that plays a live stream.
-2. On every page load, `stream_hooks.js` is injected into the WebView — using the same XHR / `fetch` / `WebSocket` / `srcObject` hooks as the Chrome extension's content script.
-3. When a stream URL is detected, it is forwarded to the native Android layer via a `JavascriptInterface` bridge and added to the **Detected Streams** panel.
-4. Tap **↓ Record** to start downloading. HLS streams are recorded by polling the `.m3u8` playlist and concatenating MPEG-TS segments; all other streams are downloaded progressively. Files are written directly to disk — no in-memory buffering.
+The app uses Android's [`VpnService`](https://developer.android.com/reference/android/net/VpnService) API to establish a local VPN tunnel (a TUN network interface). All TCP/UDP traffic from every app on the device is routed through this tunnel. No data leaves the device; the VPN connection terminates locally.
+
+1. Tap **Start Monitoring** → Android shows its standard VPN-permission dialog → grant it.
+2. A foreground service starts. All network traffic from every app is now inspected:
+   - **HTTP connections** (port 80): the `GET` request line and `Host` header are read to reconstruct the full URL. If the URL matches a known stream pattern (`.m3u8`, `.flv`, `.mp4`, `/live/`, …), it is added to the **Detected Streams** list.
+   - **HTTPS connections** (port 443): the TLS `ClientHello` is parsed to extract the **SNI hostname**. SNI entries are shown with a grey badge — the full URL is not available because the payload is encrypted, but the hostname is shown for reference.
+3. All traffic is **forwarded transparently** via `protect()`-ed sockets so that every app on the device continues to work normally.
+4. Tap **↓ Record** on any detected stream to start downloading it. HLS streams are recorded by polling the `.m3u8` playlist and concatenating MPEG-TS segments; all other streams are downloaded progressively. Files are written directly to disk — no in-memory buffering.
 5. Tap **■ Stop** to end a recording at any time.
+6. Use the **+ URL** button to add a stream URL manually at any time.
+
+### What can be detected
+
+| Protocol | Detected | Full URL available | Recordable |
+|---|---|---|---|
+| HTTP stream (FLV, MP4, HLS, MPEG-TS) | ✅ | ✅ | ✅ |
+| HTTPS stream (HLS, FLV, MP4, …) | ✅ (SNI hostname only) | ❌ (encrypted) | ❌ |
+| HTTPS stream — manual URL known | — | n/a | ✅ via + URL |
+| RTMP / RTSP (plain) | ✅ | ✅ | ✅ |
+| QUIC / HTTP/3 | ❌ (UDP, not inspected) | ❌ | ❌ |
+
+> **Note on HTTPS:** Most modern streaming apps use HTTPS, which means only the SNI hostname is visible without a MITM certificate. For those streams, copy the URL from the app or use the browser's share feature, then paste it into the **+ URL** dialog to record.
 
 ### Features
 
-- Built-in browser with address bar and back/forward/refresh navigation
-- Automatic stream detection: HLS/m3u8, FLV, MP4, MPEG-TS, WebSocket binary streams, WebRTC
-- Manual URL entry (`+ URL` button in the stream panel)
+- Detects streams from **every installed app** — video players, social apps, browser, etc.
+- No root required; uses the standard Android VPN permission
+- HTTP stream URLs extracted automatically (full URL + type badge)
+- TLS/HTTPS SNI hostnames shown for awareness
+- Manual URL entry (`+ URL` button)
 - Real-time download progress (bytes written, segment count for HLS)
 - Recordings saved to `Android/data/com.github.zero3k20.livestreamrecorder/files/LivestreamRecorder/`
+- Persistent foreground notification with **Stop Monitoring** action
 - Min Android version: **8.0 (API 26)**
 
 ### Building

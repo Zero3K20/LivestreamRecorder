@@ -14,6 +14,7 @@
     <color name="badge_mp4">#FF1B5E20</color>
     <color name="badge_webm">#FF0D47A1</color>
     <color name="badge_ws">#FF880E4F</color>
+    <color name="badge_sni">#FF546E7A</color>
     <color name="badge_direct">#FF37474F</color>
 
     <!-- Status text colours -->

@@ -1,17 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Livestream Recorder</string>
-    <string name="url_hint">Enter URL or search…</string>
-    <string name="back">Back</string>
-    <string name="forward">Forward</string>
-    <string name="refresh">Refresh</string>
-    <string name="show_streams">Show detected streams</string>
+
+    <!-- VPN status card -->
+    <string name="vpn_status_idle">Idle — not monitoring</string>
+    <string name="vpn_status_active">● Monitoring all apps</string>
+    <string name="vpn_description">Intercepts HTTP and HTTPS traffic from every app to detect live streams. All traffic is forwarded transparently; no data leaves your device.</string>
+    <string name="start_monitoring">Start Monitoring</string>
+    <string name="stop_monitoring">Stop Monitoring</string>
+    <string name="vpn_permission_denied">VPN permission is required to monitor network traffic.</string>
+
+    <!-- Notification -->
+    <string name="notif_vpn_monitoring">Monitoring network traffic for streams…</string>
+    <string name="notif_channel_desc">Shows while the stream monitor is active</string>
+
+    <!-- Stream list -->
     <string name="detected_streams">Detected Streams</string>
-    <string name="no_streams_detected">No streams detected yet.\nBrowse to a page that plays a live stream.</string>
-    <string name="record">↓ Record</string>
-    <string name="stop">■ Stop</string>
+    <string name="no_streams_detected">No streams detected yet.\nStart monitoring and open any app that plays a live stream.</string>
     <string name="add_url">+ URL</string>
     <string name="add_stream_url">Add Stream URL</string>
     <string name="clear">Clear</string>
-    <string name="permission_required">Storage permission is required to save recordings.</string>
+    <string name="record">↓ Record</string>
+    <string name="stop">■ Stop</string>
+
+    <!-- Permissions -->
+    <string name="permission_required">Notification permission is needed to show download progress.</string>
 </resources>

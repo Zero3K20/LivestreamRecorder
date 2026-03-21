@@ -51,9 +51,24 @@ class StreamAdapter(
             "mp4"       -> R.color.badge_mp4
             "webm"      -> R.color.badge_webm
             "websocket" -> R.color.badge_ws
+            "sni"       -> R.color.badge_sni
             else        -> R.color.badge_direct
         }
         holder.tvType.setBackgroundColor(ctx.getColor(tintRes))
+
+        // SNI-only entries are HTTPS streams where only the hostname is known;
+        // the full URL cannot be recorded, so the Record/Stop buttons are hidden.
+        // Must explicitly set VISIBLE in the else branch to handle ViewHolder recycling.
+        val isSniOnly = stream.type.lowercase() == "sni"
+        if (isSniOnly) {
+            holder.btnRecord.visibility = View.GONE
+            holder.btnStop.visibility   = View.GONE
+        } else {
+            // Individual download-state blocks below will set the correct visibility;
+            // reset to a known state first so recycled holders don't show stale values.
+            holder.btnRecord.visibility = View.VISIBLE
+            holder.btnStop.visibility   = View.GONE
+        }
 
         when (state) {
             is DownloadState.Downloading -> {

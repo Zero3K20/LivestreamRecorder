@@ -1,18 +1,13 @@
 package com.github.zero3k20.livestreamrecorder
 
-import android.Manifest
-import android.annotation.SuppressLint
-import android.content.pm.PackageManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
-import android.view.KeyEvent
 import android.view.View
-import android.view.inputmethod.EditorInfo
-import android.webkit.JavascriptInterface
-import android.webkit.WebChromeClient
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -23,143 +18,80 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.github.zero3k20.livestreamrecorder.databinding.ActivityMainBinding
-import com.google.android.material.bottomsheet.BottomSheetBehavior
 
+/**
+ * Main screen: lets the user start/stop the VPN-based stream monitor and shows
+ * every stream URL detected across all apps on the device.
+ *
+ * How it works:
+ *   1. User taps "Start Monitoring".
+ *   2. Android shows the standard VPN-permission dialog.
+ *   3. On approval, [StreamCaptureVpnService] is started as a foreground service.
+ *   4. The service intercepts all TCP/UDP traffic via a local TUN interface:
+ *        - HTTP  → full stream URL extracted from GET request + Host header
+ *        - HTTPS → SNI hostname extracted from TLS ClientHello
+ *        - All traffic is forwarded transparently so every app keeps working.
+ *   5. Detected URLs are broadcast to this Activity and added to the list.
+ *   6. The user taps "↓ Record" to start a local download.
+ */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private val viewModel: StreamViewModel by viewModels()
-    private lateinit var bottomSheetBehavior: BottomSheetBehavior<View>
     private lateinit var streamAdapter: StreamAdapter
 
-    private val requestPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        val allGranted = permissions.values.all { it }
-        if (!allGranted) {
-            Toast.makeText(this, getString(R.string.permission_required), Toast.LENGTH_LONG).show()
+    // ── VPN permission ────────────────────────────────────────────────────────
+
+    private val vpnPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            startVpnService()
+        } else {
+            Toast.makeText(this, R.string.vpn_permission_denied, Toast.LENGTH_LONG).show()
         }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
+    // ── Broadcast receiver ────────────────────────────────────────────────────
+
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                StreamCaptureVpnService.ACTION_STREAM_DETECTED -> {
+                    val url  = intent.getStringExtra(StreamCaptureVpnService.EXTRA_STREAM_URL)  ?: return
+                    val type = intent.getStringExtra(StreamCaptureVpnService.EXTRA_STREAM_TYPE) ?: "direct"
+                    viewModel.addStream(url, type)
+                }
+                StreamCaptureVpnService.ACTION_VPN_STATE -> {
+                    val running = intent.getBooleanExtra(StreamCaptureVpnService.EXTRA_VPN_RUNNING, false)
+                    viewModel.setVpnRunning(running)
+                }
+            }
+        }
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        setupWebView()
-        setupNavBar()
-        setupBottomSheet()
+        setupRecyclerView()
+        setupButtons()
         observeViewModel()
-        requestRequiredPermissions()
+        registerBroadcastReceiver()
         registerBackHandler()
-
-        // Default landing page — user can navigate anywhere from here
-        binding.webView.loadUrl("https://www.youtube.com/live")
     }
 
-    // ─── WebView setup ────────────────────────────────────────────────────────
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun setupWebView() {
-        binding.webView.settings.apply {
-            javaScriptEnabled       = true
-            domStorageEnabled       = true
-            // Allow playing media without a user gesture so live streams start
-            mediaPlaybackRequiresUserGesture = false
-            loadWithOverviewMode    = true
-            useWideViewPort         = true
-            mixedContentMode        = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-            // Identify as a real mobile Chrome so streaming sites serve proper URLs
-            userAgentString =
-                "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36"
-        }
-
-        // Register the bridge before any page loads
-        binding.webView.addJavascriptInterface(LSRBridge(), "LSRBridge")
-
-        binding.webView.webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
-                super.onPageStarted(view, url, favicon)
-                binding.urlBar.setText(url)
-                // Inject hooks as early as possible — equivalent to @run-at document-start
-                injectStreamHooks(view)
-            }
-
-            override fun onPageFinished(view: WebView, url: String) {
-                super.onPageFinished(view, url)
-                // Re-inject after full page load to catch late-initialised players
-                injectStreamHooks(view)
-            }
-        }
-
-        binding.webView.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView, newProgress: Int) {
-                binding.loadingBar.progress   = newProgress
-                binding.loadingBar.visibility =
-                    if (newProgress < 100) View.VISIBLE else View.GONE
-            }
-
-            override fun onReceivedTitle(view: WebView, title: String) {
-                supportActionBar?.subtitle = title
-            }
-        }
+    override fun onDestroy() {
+        unregisterReceiver(receiver)
+        super.onDestroy()
     }
 
-    private fun injectStreamHooks(webView: WebView) {
-        try {
-            val script = assets.open("stream_hooks.js").bufferedReader().use { it.readText() }
-            webView.evaluateJavascript(script, null)
-        } catch (e: Exception) {
-            // Non-fatal — page will still load without stream detection
-        }
-    }
+    // ── UI setup ──────────────────────────────────────────────────────────────
 
-    // ─── Navigation bar ───────────────────────────────────────────────────────
-
-    private fun setupNavBar() {
-        binding.btnBack.setOnClickListener {
-            if (binding.webView.canGoBack()) binding.webView.goBack()
-        }
-        binding.btnForward.setOnClickListener {
-            if (binding.webView.canGoForward()) binding.webView.goForward()
-        }
-        binding.btnRefresh.setOnClickListener {
-            binding.webView.reload()
-        }
-        binding.btnShowStreams.setOnClickListener {
-            toggleBottomSheet()
-        }
-
-        binding.urlBar.setOnEditorActionListener { view, actionId, event ->
-            val isGo = actionId == EditorInfo.IME_ACTION_GO ||
-                (event?.keyCode == KeyEvent.KEYCODE_ENTER &&
-                    event.action == KeyEvent.ACTION_DOWN)
-            if (isGo) {
-                navigateTo(view.text.toString().trim())
-                true
-            } else false
-        }
-    }
-
-    private fun navigateTo(input: String) {
-        val url = when {
-            input.startsWith("http://") || input.startsWith("https://") -> input
-            input.contains('.') && !input.contains(' ')                 -> "https://$input"
-            else -> "https://www.google.com/search?q=${input.replace(' ', '+')}"
-        }
-        binding.webView.loadUrl(url)
-    }
-
-    // ─── Bottom sheet ─────────────────────────────────────────────────────────
-
-    private fun setupBottomSheet() {
-        @Suppress("UNCHECKED_CAST")
-        bottomSheetBehavior = BottomSheetBehavior.from(binding.bottomSheet) as BottomSheetBehavior<View>
-        bottomSheetBehavior.state      = BottomSheetBehavior.STATE_HIDDEN
-        bottomSheetBehavior.isHideable = true
-
+    private fun setupRecyclerView() {
         streamAdapter = StreamAdapter(
             onRecord = { stream -> viewModel.startDownload(stream) },
             onStop   = { stream -> viewModel.stopDownload(stream.id) }
@@ -168,29 +100,37 @@ class MainActivity : AppCompatActivity() {
             layoutManager = LinearLayoutManager(this@MainActivity)
             adapter       = streamAdapter
         }
+    }
 
+    private fun setupButtons() {
+        binding.btnToggleVpn.setOnClickListener {
+            if (viewModel.vpnRunning.value == true) stopVpnService()
+            else requestVpnPermission()
+        }
         binding.btnClearStreams.setOnClickListener { viewModel.clearDetectedStreams() }
         binding.btnAddManual.setOnClickListener    { showManualUrlDialog() }
     }
 
-    private fun toggleBottomSheet() {
-        bottomSheetBehavior.state =
-            if (bottomSheetBehavior.state == BottomSheetBehavior.STATE_HIDDEN)
-                BottomSheetBehavior.STATE_EXPANDED
-            else
-                BottomSheetBehavior.STATE_HIDDEN
-    }
-
-    // ─── ViewModel observation ────────────────────────────────────────────────
-
     private fun observeViewModel() {
+        viewModel.vpnRunning.observe(this) { running ->
+            binding.btnToggleVpn.text = getString(
+                if (running) R.string.stop_monitoring else R.string.start_monitoring
+            )
+            binding.tvVpnStatus.text = getString(
+                if (running) R.string.vpn_status_active else R.string.vpn_status_idle
+            )
+            binding.tvVpnStatus.setTextColor(
+                getColor(if (running) R.color.status_success else R.color.status_neutral)
+            )
+            binding.statusIndicator.setBackgroundColor(
+                getColor(if (running) R.color.status_success else R.color.status_neutral)
+            )
+        }
+
         viewModel.detectedStreams.observe(this) { streams ->
             streamAdapter.updateStreams(streams)
             binding.tvNoStreams.visibility =
                 if (streams.isEmpty()) View.VISIBLE else View.GONE
-            // Show stream count on the toolbar button
-            binding.btnShowStreams.text =
-                if (streams.isEmpty()) "⏺" else "⏺ ${streams.size}"
         }
 
         viewModel.downloadStates.observe(this) { states ->
@@ -198,11 +138,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ─── Manual URL entry ─────────────────────────────────────────────────────
+    // ── VPN control ───────────────────────────────────────────────────────────
+
+    private fun requestVpnPermission() {
+        val intent = VpnService.prepare(this)
+        if (intent == null) startVpnService()        // already granted
+        else vpnPermissionLauncher.launch(intent)
+    }
+
+    private fun startVpnService() {
+        ContextCompat.startForegroundService(
+            this,
+            Intent(this, StreamCaptureVpnService::class.java).apply {
+                action = StreamCaptureVpnService.ACTION_START
+            }
+        )
+    }
+
+    private fun stopVpnService() {
+        startService(
+            Intent(this, StreamCaptureVpnService::class.java).apply {
+                action = StreamCaptureVpnService.ACTION_STOP
+            }
+        )
+    }
+
+    // ── Manual URL dialog ─────────────────────────────────────────────────────
 
     private fun showManualUrlDialog() {
         val input = EditText(this).apply {
-            hint    = "https://example.com/stream.m3u8"
+            hint      = "https://example.com/stream.m3u8"
             setSingleLine()
         }
         AlertDialog.Builder(this)
@@ -215,71 +180,40 @@ class MainActivity : AppCompatActivity() {
                         url.contains(".m3u8") -> "hls"
                         url.contains(".flv")  -> "flv"
                         url.contains(".mp4")  -> "mp4"
-                        url.contains(".webm") -> "webm"
                         url.startsWith("ws")  -> "websocket"
                         else                  -> "direct"
                     }
                     viewModel.addStream(url, type)
-                    // Expand the bottom sheet so the user can see the new entry
-                    bottomSheetBehavior.state = BottomSheetBehavior.STATE_EXPANDED
                 }
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
     }
 
-    // ─── Permissions ──────────────────────────────────────────────────────────
+    // ── Broadcast receiver ────────────────────────────────────────────────────
 
-    private fun requestRequiredPermissions() {
-        val needed = mutableListOf<String>()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                needed.add(Manifest.permission.POST_NOTIFICATIONS)
-            }
+    private fun registerBroadcastReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(StreamCaptureVpnService.ACTION_STREAM_DETECTED)
+            addAction(StreamCaptureVpnService.ACTION_VPN_STATE)
         }
-        if (needed.isNotEmpty()) requestPermissionLauncher.launch(needed.toTypedArray())
+        // Broadcasts are only delivered within this package (explicit package set
+        // in the sendBroadcast calls in StreamCaptureVpnService), so NOT_EXPORTED.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
+        }
     }
 
-    // ─── Back-press handling ──────────────────────────────────────────────────
+    // ── Back press ────────────────────────────────────────────────────────────
 
     private fun registerBackHandler() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                when {
-                    bottomSheetBehavior.state != BottomSheetBehavior.STATE_HIDDEN ->
-                        bottomSheetBehavior.state = BottomSheetBehavior.STATE_HIDDEN
-                    binding.webView.canGoBack() -> binding.webView.goBack()
-                    else -> {
-                        isEnabled = false
-                        onBackPressedDispatcher.onBackPressed()
-                    }
-                }
+                isEnabled = false
+                onBackPressedDispatcher.onBackPressed()
             }
         })
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        binding.webView.destroy()
-    }
-
-    // ─── JavaScript bridge ────────────────────────────────────────────────────
-
-    /**
-     * Called from stream_hooks.js whenever a stream URL is detected.
-     * JavascriptInterface callbacks run on a background thread, so WebView
-     * properties are read on the main thread via runOnUiThread.
-     */
-    inner class LSRBridge {
-        @JavascriptInterface
-        fun onStreamDetected(url: String, type: String) {
-            runOnUiThread {
-                val pageUrl   = binding.webView.url   ?: ""
-                val pageTitle = binding.webView.title ?: ""
-                viewModel.addStream(url, type, pageUrl, pageTitle)
-            }
-        }
     }
 }

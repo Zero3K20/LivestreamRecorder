@@ -9,16 +9,18 @@ import com.github.zero3k20.livestreamrecorder.models.DownloadState
 import com.github.zero3k20.livestreamrecorder.models.StreamInfo
 
 /**
- * Shared ViewModel that holds the list of detected streams and their
- * download states.  The Activity and the bottom-sheet stream panel both
- * observe the same instance so UI updates are consistent.
+ * Shared ViewModel that holds the VPN-monitoring state, the list of detected
+ * streams, and per-stream download states.
  */
 class StreamViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val _vpnRunning      = MutableLiveData(false)
+    val vpnRunning: LiveData<Boolean> = _vpnRunning
 
     private val _detectedStreams = MutableLiveData<List<StreamInfo>>(emptyList())
     val detectedStreams: LiveData<List<StreamInfo>> = _detectedStreams
 
-    private val _downloadStates = MutableLiveData<Map<String, DownloadState>>(emptyMap())
+    private val _downloadStates  = MutableLiveData<Map<String, DownloadState>>(emptyMap())
     val downloadStates: LiveData<Map<String, DownloadState>> = _downloadStates
 
     private val downloadManager = DownloadManager(application)
@@ -26,10 +28,14 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     /** Deduplicate by URL so the same stream is never listed twice. */
     private val seenUrls = mutableSetOf<String>()
 
-    fun addStream(url: String, type: String, pageUrl: String = "", pageTitle: String = "") {
+    fun setVpnRunning(running: Boolean) {
+        _vpnRunning.postValue(running)
+    }
+
+    fun addStream(url: String, type: String) {
         if (url.isBlank() || url in seenUrls) return
         seenUrls.add(url)
-        val stream = StreamInfo(url = url, type = type, pageUrl = pageUrl, pageTitle = pageTitle)
+        val stream = StreamInfo(url = url, type = type)
         val current = _detectedStreams.value.orEmpty()
         _detectedStreams.postValue(current + stream)
     }
