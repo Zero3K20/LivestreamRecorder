@@ -10,6 +10,7 @@ import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import com.github.zero3k20.livestreamrecorder.network.PacketParser
 import com.github.zero3k20.livestreamrecorder.network.TcpProxyHandler
+import com.github.zero3k20.livestreamrecorder.network.UdpFlowTable
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -19,12 +20,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
 
 /**
  * A [VpnService] that routes all TCP/UDP traffic on the device through a local
@@ -69,6 +66,7 @@ class StreamCaptureVpnService : VpnService() {
     private var tunIn:    FileInputStream?      = null
     private var tunOut:   FileOutputStream?     = null
     private var tcpProxy: TcpProxyHandler?      = null
+    private var udpFlows: UdpFlowTable?         = null
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -111,6 +109,12 @@ class StreamCaptureVpnService : VpnService() {
             }
         )
 
+        udpFlows = UdpFlowTable(
+            vpnService = this,
+            tunWrite   = tunWrite,
+            scope      = scope
+        )
+
         val iface = Builder()
             .addAddress("10.0.0.2", 32)
             .addRoute("0.0.0.0", 0)           // capture all traffic
@@ -134,6 +138,7 @@ class StreamCaptureVpnService : VpnService() {
     private fun stopVpn() {
         scope.cancel()
         tcpProxy?.closeAll()
+        udpFlows?.closeAll()
         runCatching { tunIn?.close() }
         runCatching { tunOut?.close() }
         runCatching { vpnIface?.close() }
@@ -156,50 +161,11 @@ class StreamCaptureVpnService : VpnService() {
                 try {
                     when (PacketParser.ipProto(pkt)) {
                         PacketParser.PROTO_TCP -> tcpProxy?.handlePacket(pkt)
-                        PacketParser.PROTO_UDP -> scope.launch { forwardUdp(pkt) }
+                        PacketParser.PROTO_UDP -> udpFlows?.handlePacket(pkt)
                     }
                 } catch (_: Exception) { /* skip malformed packet; keep loop alive */ }
             }
         } catch (_: Exception) { /* TUN fd closed on stopVpn() */ }
-    }
-
-    // ── UDP forwarding (DNS and other UDP traffic) ────────────────────────────
-
-    /**
-     * Forwards a single UDP datagram to its real destination via a protect()-ed
-     * DatagramSocket, then writes the response back to the TUN interface.
-     * DNS (port 53) is the most common case; QUIC/HTTP3 (port 443) is also
-     * common but its responses are much larger and may be multi-packet; we
-     * forward the first response datagram which is sufficient for DNS.
-     */
-    private suspend fun forwardUdp(pkt: ByteArray) = withContext(Dispatchers.IO) {
-        try {
-            val ipHdrLen = PacketParser.ipIHL(pkt)
-            val srcAddr  = PacketParser.ipSrc(pkt)
-            val dstAddr  = PacketParser.ipDst(pkt)
-            val srcPort  = PacketParser.udpSrc(pkt, ipHdrLen)
-            val dstPort  = PacketParser.udpDst(pkt, ipHdrLen)
-            val payload  = PacketParser.udpPayload(pkt, ipHdrLen)
-
-            val sock = DatagramSocket()
-            protect(sock)
-            val dst = InetAddress.getByAddress(dstAddr)
-            sock.soTimeout = 5_000
-            sock.send(DatagramPacket(payload, payload.size, dst, dstPort))
-
-            val respBuf = ByteArray(4_096)
-            val resp    = DatagramPacket(respBuf, respBuf.size)
-            sock.receive(resp)
-            sock.close()
-
-            // Build a UDP response packet with src/dst swapped (server → client).
-            val respPkt = PacketParser.buildUdpPacket(
-                srcAddr = dstAddr, dstAddr = srcAddr,
-                srcPort = dstPort, dstPort = srcPort,
-                payload = resp.data.copyOf(resp.length)
-            )
-            writeMutex.withLock { tunOut?.write(respPkt) }
-        } catch (_: Exception) { /* timeout or unreachable — client will retry */ }
     }
 
     // ── Notification ──────────────────────────────────────────────────────────
