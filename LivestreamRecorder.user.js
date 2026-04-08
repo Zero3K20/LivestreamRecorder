@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.28
+// @version      1.4.29
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -49,6 +49,22 @@
      * generous while keeping overhead negligible for any unexpectedly large message.
      */
     const MAX_WORKER_MSG_SCAN_CHARS = 200000;
+
+    /**
+     * Flush timing for _makeFlushingWriter.  FileSystemWritableFileStream writes
+     * to a hidden swap file; the real file stays at 0 bytes until close().
+     * Periodically closing and reopening the writable commits accumulated data so
+     * the file is visible and playable in media players while recording continues.
+     *
+     * A time-based trigger is used (rather than byte count) so slow streams —
+     * which may never accumulate a large byte threshold — still flush promptly.
+     * The interval grows after each flush to limit the cost of re-copying an
+     * ever-larger file on systems without copy-on-write filesystems.
+     */
+    const FLUSH_INTERVAL_MS_INITIAL =  10_000; // first flush after 10 s
+    const FLUSH_INTERVAL_MS_STEP    =   5_000; // each subsequent flush waits 5 s longer
+    const FLUSH_INTERVAL_MS_MAX     =  60_000; // cap at 1 min between flushes
+    const FLUSH_MIN_BYTES           = 64 * 1024; // skip flush if < 64 KB written since last
 
     /** GM storage key for the debug-mode flag. */
     const DEBUG_GM_KEY = 'lsr_debug_mode';
@@ -104,7 +120,7 @@
                 const writable = await fileHandle.createWritable({ keepExistingData: true });
                 await writable.seek(file.size);
                 await writable.write(lines.join('\n') + '\n');
-                await writable.close();
+                await _closeWritable(writable);
             } catch {
                 // best-effort — debug log write errors are silently ignored
                 break;
@@ -415,6 +431,151 @@
         return { type: 'media', segments, targetDuration, isEndList };
     }
 
+    // ─── Writable helpers ─────────────────────────────────────────────────────────
+
+    /**
+     * Close a FileSystemWritableFileStream, retrying once on InvalidStateError.
+     *
+     * Chrome throws "An operation that depends on state cached in an interface
+     * object was made but the state had changed since it was read from disk."
+     * (InvalidStateError) when the OS, a media player, antivirus, or file
+     * indexer briefly accesses the download file during a write session.  A
+     * short delay usually resolves this transient condition.
+     *
+     * @param {FileSystemWritableFileStream} writable
+     */
+    async function _closeWritable(writable) {
+        try {
+            await writable.close();
+        } catch (e) {
+            if (e.name !== 'InvalidStateError') throw e;
+            await sleep(300);
+            await writable.close(); // retry once
+        }
+    }
+
+    /**
+     * Create a write-flushing adapter around a FileSystemFileHandle.
+     *
+     * Exposes write(), seek(), and close() — the same surface as
+     * FileSystemWritableFileStream — so it can be used as a drop-in
+     * replacement everywhere a raw writable is passed around.
+     *
+     * Every FLUSH_INTERVAL_BYTES the adapter commits all data written so far to
+     * disk: it closes the current writable (via _closeWritable, which retries on
+     * InvalidStateError) and reopens it with keepExistingData:true so future
+     * writes append correctly.  This makes the partially-downloaded file visible
+     * and playable in media players while recording continues.
+     *
+     * If reopening also fails with InvalidStateError (e.g. the media player is
+     * still holding the file open), the reopen is retried up to three times with
+     * increasing back-off delays before the error is propagated.
+     *
+     * @param {FileSystemFileHandle} fileHandle
+     * @param {boolean} [keepExisting=false]  - passed to the first createWritable
+     * @param {number}  [startOffset=0]       - seek to this position after opening
+     * @returns {Promise<{write(chunk:*):Promise, seek(pos:number):Promise, close():Promise}>}
+     */
+    async function _makeFlushingWriter(fileHandle, keepExisting = false, startOffset = 0) {
+        let writable = await fileHandle.createWritable({ keepExistingData: keepExisting });
+        if (startOffset > 0) await writable.seek(startOffset);
+        let offset          = startOffset;
+        let committedOffset = startOffset; // bytes safely on disk after the last close()
+        let sinceFlush      = 0;
+        let lastFlushTime   = Date.now();
+        let nextFlushMs     = FLUSH_INTERVAL_MS_INITIAL;
+
+        /** Commit current data to disk and reopen the writable at the current offset. */
+        const flush = async () => {
+            await _closeWritable(writable);
+            writable        = null;
+            committedOffset = offset; // everything up to here is now on disk
+            for (let i = 0; i < 3; i++) {
+                try {
+                    writable = await fileHandle.createWritable({ keepExistingData: committedOffset > 0 });
+                    if (committedOffset > 0) await writable.seek(committedOffset);
+                    sinceFlush    = 0;
+                    lastFlushTime = Date.now();
+                    nextFlushMs   = Math.min(nextFlushMs + FLUSH_INTERVAL_MS_STEP, FLUSH_INTERVAL_MS_MAX);
+                    return;
+                } catch (e) {
+                    writable = null;
+                    if (e.name !== 'InvalidStateError' || i === 2) throw e;
+                    await sleep(300 * (i + 1));
+                }
+            }
+        };
+
+        /**
+         * Reopen the writable from the last committed position after an
+         * InvalidStateError on write() — thrown when the OS or a media player
+         * opens the swap file (.crswap) while the download is in progress.
+         * Data written since the previous flush is lost, but the download
+         * continues from the committed point rather than failing entirely.
+         */
+        const recoverWritable = async () => {
+            try { await writable.abort(); } catch { /* ignore errors on the errored writable */ }
+            writable = null;
+            offset   = committedOffset; // roll back cursor to last safe position
+            for (let i = 0; i < 3; i++) {
+                try {
+                    writable = await fileHandle.createWritable({ keepExistingData: committedOffset > 0 });
+                    if (committedOffset > 0) await writable.seek(committedOffset);
+                    sinceFlush    = 0;
+                    lastFlushTime = Date.now();
+                    return;
+                } catch (e) {
+                    writable = null;
+                    if (e.name !== 'InvalidStateError' || i === 2) throw e;
+                    await sleep(300 * (i + 1));
+                }
+            }
+        };
+
+        return {
+            /**
+             * Write a chunk.  If the OS or a media player opens the swap file and
+             * Chrome throws InvalidStateError, the writable is reopened from the
+             * last committed position and the write is retried so the download
+             * continues uninterrupted (only data since the previous flush is lost).
+             * Flushes to disk periodically so the real file grows and is playable.
+             */
+            async write(chunk) {
+                try {
+                    await writable.write(chunk);
+                } catch (e) {
+                    if (e.name !== 'InvalidStateError') throw e;
+                    await recoverWritable();
+                    await writable.write(chunk); // retry with the fresh writable
+                }
+                const len = chunk instanceof Blob        ? chunk.size
+                          : ArrayBuffer.isView(chunk)    ? chunk.byteLength
+                          : chunk instanceof ArrayBuffer ? chunk.byteLength
+                          : 0;
+                offset     += len;
+                sinceFlush += len;
+                if (sinceFlush >= FLUSH_MIN_BYTES && Date.now() - lastFlushTime >= nextFlushMs) {
+                    await flush();
+                }
+            },
+            /** Move the write cursor (delegates to the underlying writable). */
+            async seek(pos) {
+                await writable.seek(pos);
+                offset          = pos;
+                committedOffset = pos;
+                sinceFlush      = 0;
+                lastFlushTime   = Date.now();
+            },
+            /** Commit all written data to disk and close. */
+            async close() {
+                if (writable) {
+                    await _closeWritable(writable);
+                    writable = null;
+                }
+            },
+        };
+    }
+
     // ─── HLS / m3u8 downloader ────────────────────────────────────────────────────
 
     /**
@@ -429,8 +590,7 @@
      */
     async function downloadHLS(url, fileHandle, onProgress, stopSignal, opts = {}) {
         const { keepExisting = false, seekOffset = 0 } = opts;
-        const writable = await fileHandle.createWritable({ keepExistingData: keepExisting });
-        if (seekOffset > 0) await writable.seek(seekOffset);
+        const writer = await _makeFlushingWriter(fileHandle, keepExisting, seekOffset);
         // Track downloaded segment sequence numbers to avoid duplicates on live playlists.
         let lastDownloadedSequence = -1;
         let targetDuration = 5;
@@ -469,7 +629,7 @@
                     try {
                         const segResp = await gmFetch(seg.uri, { responseType: 'arraybuffer' });
                         // Write directly to disk; the ArrayBuffer is released after this await.
-                        await writable.write(segResp.response);
+                        await writer.write(segResp.response);
                         lastDownloadedSequence = seg.sequence;
                         onProgress(segResp.response.byteLength);
                     } catch (e) {
@@ -483,7 +643,7 @@
                 await sleep((targetDuration / 2) * 1000);
             }
         } finally {
-            await writable.close();
+            await writer.close();
         }
     }
 
@@ -507,7 +667,7 @@
      * proxy APIs that web players already access cross-origin typically allow it.
      *
      * @param {string} url
-     * @param {FileSystemWritableFileStream} writable  - already open, caller closes it
+     * @param {FileSystemWritableFileStream|{write(chunk:*):Promise}} writable  - already open, caller closes it
      * @param {function(number): void} onProgress
      * @param {{ stopped: boolean }} stopSignal
      */
@@ -710,8 +870,7 @@
     async function downloadDirect(url, fileHandle, onProgress, stopSignal, opts = {}) {
         const { startOffset = 0 } = opts;
         dbg('download url=%s startOffset=%d', url, startOffset);
-        const writable = await fileHandle.createWritable({ keepExistingData: startOffset > 0 });
-        if (startOffset > 0) await writable.seek(startOffset);
+        const writer = await _makeFlushingWriter(fileHandle, startOffset > 0, startOffset);
         const CHUNK = 4 * 1024 * 1024; // 4 MB per Range request
 
         try {
@@ -735,7 +894,7 @@
                 while (offset < totalSize && !stopSignal.stopped) {
                     const end = Math.min(offset + CHUNK - 1, totalSize - 1);
                     const r = await gmFetch(url, { responseType: 'arraybuffer', rangeStart: offset, rangeEnd: end });
-                    await writable.write(r.response);
+                    await writer.write(r.response);
                     onProgress(r.response.byteLength);
                     offset += r.response.byteLength;
                 }
@@ -750,7 +909,7 @@
                     dbg('download: trying GM fetch');
                     const r = await gmFetch(url, { responseType: 'arraybuffer' });
                     if (!stopSignal.stopped) {
-                        await writable.write(r.response);
+                        await writer.write(r.response);
                         onProgress(r.response.byteLength);
                     }
                 } catch (e) {
@@ -763,7 +922,7 @@
                     if (!stopSignal.stopped) {
                         try {
                             dbg('download: trying page fetch url=%s', url);
-                            await _downloadViaPageFetch(url, writable, onProgress, stopSignal);
+                            await _downloadViaPageFetch(url, writer, onProgress, stopSignal);
                             pageFetchSucceeded = true;
                             dbg('download: page fetch succeeded');
                         } catch (pageFetchErr) {
@@ -785,7 +944,7 @@
                             if (inner && !stopSignal.stopped) {
                                 try {
                                     dbg('download: trying inner URL=%s', inner);
-                                    await _downloadViaPageFetch(inner, writable, onProgress, stopSignal);
+                                    await _downloadViaPageFetch(inner, writer, onProgress, stopSignal);
                                     pageFetchSucceeded = true;
                                     dbg('download: inner URL page fetch succeeded');
                                 } catch (innerErr) {
@@ -796,12 +955,12 @@
                     }
                     if (!pageFetchSucceeded && !stopSignal.stopped) {
                         dbg('download: trying tap for url=%s', url);
-                        await _downloadViaTap(url, writable, onProgress, stopSignal);
+                        await _downloadViaTap(url, writer, onProgress, stopSignal);
                     }
                 }
             }
         } finally {
-            await writable.close();
+            await writer.close();
         }
     }
 
@@ -819,7 +978,7 @@
      */
     async function downloadWebSocket(url, fileHandle, onProgress, stopSignal) {
         if (!_OrigWebSocket) throw new Error('WebSocket is not available in this environment');
-        const writable = await fileHandle.createWritable({ keepExistingData: false });
+        const writer = await _makeFlushingWriter(fileHandle);
         try {
             await new Promise((resolve, reject) => {
                 const ws = new _OrigWebSocket(url);
@@ -834,7 +993,7 @@
                     if (stopSignal.stopped) { ws.close(); return; }
                     if (!(e.data instanceof ArrayBuffer) || e.data.byteLength === 0) return;
                     try {
-                        await writable.write(e.data);
+                        await writer.write(e.data);
                         onProgress(e.data.byteLength);
                     } catch (writeErr) {
                         cleanup();
@@ -857,7 +1016,7 @@
                 }, 250);
             });
         } finally {
-            await writable.close();
+            await writer.close();
         }
     }
 
@@ -876,7 +1035,7 @@
     async function downloadMediaRecorder(url, fileHandle, onProgress, stopSignal) {
         const stream = _webrtcStreams.get(url);
         if (!stream) throw new Error('WebRTC stream is no longer available (reload the page and try again)');
-        const writable = await fileHandle.createWritable({ keepExistingData: false });
+        const writer = await _makeFlushingWriter(fileHandle);
         try {
             await new Promise((resolve, reject) => {
                 const mimeType = [
@@ -903,7 +1062,7 @@
                     if (!e.data || e.data.size === 0) return;
                     try {
                         const buf = await e.data.arrayBuffer();
-                        await writable.write(buf);
+                        await writer.write(buf);
                         onProgress(buf.byteLength);
                     } catch (writeErr) {
                         clearStopTimer();
@@ -930,7 +1089,7 @@
                 }, 250);
             });
         } finally {
-            await writable.close();
+            await writer.close();
         }
     }
 
@@ -1035,7 +1194,9 @@
             if (!stopSignal.stopped) dl.status = 'completed';
         } catch (e) {
             console.error('[LivestreamRecorder] Download error:', e);
-            dl.status = 'error: ' + e.message;
+            dl.status = e.name === 'InvalidStateError'
+                ? 'error: the file was opened by another program while downloading — please try again'
+                : 'error: ' + e.message;
         }
 
         updateUI();
