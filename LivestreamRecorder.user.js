@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.31
+// @version      1.4.30
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -327,25 +327,13 @@
 
     /**
      * Fetch a URL via GM_xmlhttpRequest (bypasses CORS).
-     * Automatically includes Referer and Origin headers matching the current page
-     * so that streaming servers that check these headers (a common anti-hotlinking
-     * measure) accept the request without requiring the page's native fetch.
-     * Callers may override these headers by passing them explicitly in opts.headers.
      * @param {string} url
      * @param {{ method?: string, responseType?: string, headers?: object, rangeStart?: number, rangeEnd?: number }} [opts]
      * @returns {Promise<{status: number, response: any, responseText: string}>}
      */
     function gmFetch(url, opts = {}) {
         const { method = 'GET', responseType = 'text', headers = {}, rangeStart, rangeEnd } = opts;
-        // Inject Referer and Origin so the request looks like it came from the page.
-        // GM_xmlhttpRequest is allowed to set these privileged headers (unlike XHR),
-        // and many streaming servers (including hotlivethai.net) began enforcing
-        // Referer checks on HLS playlist and segment requests.  Callers can still
-        // override these by including them in opts.headers.
-        const reqHeaders = Object.assign(
-            { Referer: location.href, Origin: location.origin },
-            headers
-        );
+        const reqHeaders = Object.assign({}, headers);
         if (rangeStart !== undefined) {
             const end = rangeEnd !== undefined ? rangeEnd : '';
             reqHeaders['Range'] = `bytes=${rangeStart}-${end}`;
