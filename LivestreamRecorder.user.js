@@ -1169,30 +1169,47 @@
                 }
 
                 let stopCheckTimer = null;
+                // Serialize all chunk writes so concurrent ondataavailable events
+                // never call writer.write() or flush() at the same time, which
+                // would race on the underlying WritableStream and produce:
+                //   • "Cannot read properties of null (reading 'write')"  (writable=null during flush)
+                //   • "Cannot close a closed or closing stream"           (double-close on flush)
+                let pendingWrite = Promise.resolve();
+                // Prevent the promise from being settled more than once (e.g. both
+                // onerror and onstop fire, or a write error races with onstop).
+                let settled = false;
 
                 const clearStopTimer = () => {
                     if (stopCheckTimer !== null) { clearInterval(stopCheckTimer); stopCheckTimer = null; }
                 };
 
-                recorder.ondataavailable = async (e) => {
+                const resolveOnce = () => { if (!settled) { settled = true; resolve(); } };
+                const rejectOnce  = (err) => { if (!settled) { settled = true; reject(err); } };
+
+                recorder.ondataavailable = (e) => {
                     if (!e.data || e.data.size === 0) return;
-                    try {
+                    // Chain onto pendingWrite to serialise writes; re-throw to keep
+                    // the chain rejected so subsequent events are skipped.
+                    pendingWrite = pendingWrite.then(async () => {
                         const buf = await e.data.arrayBuffer();
                         await writer.write(buf);
                         onProgress(buf.byteLength);
-                    } catch (writeErr) {
+                    }).catch((writeErr) => {
                         clearStopTimer();
                         if (recorder.state !== 'inactive') recorder.stop();
-                        reject(writeErr);
-                    }
+                        rejectOnce(writeErr);
+                        throw writeErr;
+                    });
                 };
 
                 recorder.onerror = (e) => {
                     clearStopTimer();
-                    reject(e.error || new Error('MediaRecorder error'));
+                    rejectOnce(e.error || new Error('MediaRecorder error'));
                 };
 
-                recorder.onstop = resolve;
+                // Wait for all pending writes to drain before resolving so that
+                // writer.close() in the finally block never races an in-flight write.
+                recorder.onstop = () => { pendingWrite.then(resolveOnce, rejectOnce); };
 
                 // 500 ms chunks give smooth progress updates without excessive overhead.
                 recorder.start(500);
