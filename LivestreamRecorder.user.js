@@ -617,6 +617,11 @@
             if (initialParsed.type === 'master') {
                 if (initialParsed.streams.length === 0) throw new Error('No streams found in master playlist');
                 mediaURL = initialParsed.streams[0].uri; // highest bandwidth
+            } else {
+                // Seed timing from the media playlist so the very first sleep uses the
+                // correct duration rather than the hardcoded 5 s default.
+                targetDuration = initialParsed.targetDuration;
+                lastSegDuration = targetDuration;
             }
 
             while (!stopSignal.stopped) {
