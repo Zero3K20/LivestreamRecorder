@@ -66,6 +66,13 @@
     const FLUSH_INTERVAL_MS_MAX     =  60_000; // cap at 1 min between flushes
     const FLUSH_MIN_BYTES           = 64 * 1024; // skip flush if < 64 KB written since last
 
+    /**
+     * How many consecutive fetch failures on a single predicted segment before
+     * exiting the predictive loop and falling back to normal playlist polling.
+     * A 403 (token expired) bypasses this limit and triggers a fallback immediately.
+     */
+    const HLS_PREDICTIVE_SEGMENT_MAX_RETRIES = 3;
+
     /** GM storage key for the debug-mode flag. */
     const DEBUG_GM_KEY = 'lsr_debug_mode';
 
@@ -579,6 +586,58 @@
     // ─── HLS / m3u8 downloader ────────────────────────────────────────────────────
 
     /**
+     * Inspect a list of playlist segments and detect whether their URLs follow a
+     * predictive numeric pattern: a constant prefix, a monotonically incrementing
+     * integer embedded in the filename, and a constant suffix (extension + query
+     * string).
+     *
+     * Only the *last* contiguous run of digits inside the filename (before any
+     * '/' path separator) is treated as the sequence counter, so numeric
+     * components earlier in the URL (hash IDs, stream IDs) are not confused with
+     * the segment counter.
+     *
+     * Returns a descriptor when all segments share the same prefix/suffix and a
+     * uniform positive step between sequence numbers, or null otherwise.
+     *
+     * Example — the following three segments produce a valid pattern:
+     *   prefix-1775687136.ts?txspiseq=103393458014363380195
+     *   prefix-1775687137.ts?txspiseq=103393458014363380195  (step = 1)
+     *   prefix-1775687138.ts?txspiseq=103393458014363380195
+     *
+     * @param {Array<{uri: string}>} segments
+     * @returns {{ prefix: string, suffix: string, sequence: number, step: number }|null}
+     */
+    function detectSegmentURLPattern(segments) {
+        if (segments.length < 2) return null;
+        // Capture the last run of digits in the filename (path component).
+        // Group 1: everything up to (but not including) the last digit run.
+        // Group 2: the last digit run itself.
+        // Group 3: '.' followed by the rest of the URL (extension + optional
+        //          query/fragment); [^/]* ensures we stay within the filename.
+        //
+        // The leading dot in group 3 is intentional and load-bearing: it anchors
+        // the match so that group 2 captures the sequence number just before the
+        // file extension, rather than trailing digits in the query string (e.g.
+        // '?txspiseq=103393458014363380195').  Extensionless segment URLs therefore
+        // return null and fall back to normal playlist polling.
+        const SEQ_RE = /^(.*[^\d])(\d+)(\.[^/]*)$/;
+        const matches = segments.map((s) => SEQ_RE.exec(s.uri));
+        if (matches.some((m) => !m)) return null;
+
+        const prefix = matches[0][1];
+        const suffix = matches[0][3];
+        // Every segment must share identical prefix and suffix.
+        if (!matches.every((m) => m[1] === prefix && m[3] === suffix)) return null;
+
+        const seqNums = matches.map((m) => parseInt(m[2], 10));
+        const step    = seqNums[1] - seqNums[0];
+        if (step <= 0) return null; // step must be positive; uniformity is verified below
+        if (!seqNums.every((n, i) => i === 0 || n - seqNums[i - 1] === step)) return null;
+
+        return { prefix, suffix, sequence: seqNums[seqNums.length - 1], step };
+    }
+
+    /**
      * Download an HLS stream segment-by-segment, writing each segment directly to
      * the FileSystemWritableFileStream so nothing large stays in memory.
      *
@@ -648,11 +707,56 @@
 
                 if (playlist.isEndList) break;
 
-                // If we downloaded new segments, the next one won't be ready for roughly
-                // one segment duration — sleep that long to avoid a guaranteed-empty poll.
-                // If nothing new was found we're waiting for the server to produce the next
-                // segment, so poll more aggressively at half the target-duration window.
-                await sleep((newSegments > 0 ? lastSegDuration : targetDuration / 2) * 1000);
+                // ── Predictive download phase ──────────────────────────────────────────
+                // If segment URLs follow an incrementing-sequence pattern (e.g.
+                //   prefix-1775687136.ts?token=…
+                //   prefix-1775687137.ts?token=…  step = 1)
+                // predict and download subsequent segments directly without
+                // re-fetching the playlist.  The loop runs until the user stops,
+                // or until repeated fetch failures signal that the segment is not
+                // available (stream ended / sequence jumped) or the token expired
+                // (403), at which point control returns to the outer polling loop.
+                let attemptedPredictive = false;
+                const pattern = detectSegmentURLPattern(playlist.segments);
+                if (pattern && !stopSignal.stopped) {
+                    attemptedPredictive = true;
+                    dbg('HLS predictive: prefix=%s suffix=%s step=%d from seq=%d',
+                        pattern.prefix, pattern.suffix, pattern.step, lastDownloadedSequence);
+                    let segRetries  = 0;
+                    let predictedSeq = lastDownloadedSequence;
+
+                    while (!stopSignal.stopped) {
+                        const nextSeq = predictedSeq + pattern.step;
+                        const nextURI = pattern.prefix + nextSeq + pattern.suffix;
+                        try {
+                            const segResp = await gmFetch(nextURI, { responseType: 'arraybuffer' });
+                            await writer.write(segResp.response);
+                            predictedSeq           = nextSeq;
+                            lastDownloadedSequence = nextSeq;
+                            segRetries             = 0;
+                            onProgress(segResp.response.byteLength);
+                        } catch (e) {
+                            segRetries++;
+                            dbg('HLS predictive segment error (seq=%d retry=%d): %s',
+                                nextSeq, segRetries, e.message);
+                            // 403 means the URL token has expired — exit immediately
+                            // so the outer loop re-fetches the playlist with a fresh token.
+                            // For other errors (typically 404: not yet published), retry
+                            // up to HLS_PREDICTIVE_SEGMENT_MAX_RETRIES times with backoff.
+                            if (e.isGmForbidden || segRetries >= HLS_PREDICTIVE_SEGMENT_MAX_RETRIES) break;
+                            await sleep((targetDuration / 2) * 1000);
+                        }
+                    }
+                    dbg('HLS predictive: exited at seq=%d', predictedSeq);
+                }
+                // ── End predictive phase ──────────────────────────────────────────────
+
+                // Skip the inter-poll sleep when the predictive phase was attempted:
+                // the retry waits inside the predictive loop already provide back-off.
+                // For non-predictable streams, use the original timing heuristic.
+                if (!attemptedPredictive) {
+                    await sleep((newSegments > 0 ? lastSegDuration : targetDuration / 2) * 1000);
+                }
             }
         } finally {
             await writer.close();
