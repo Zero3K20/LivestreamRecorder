@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.30
+// @version      1.4.31
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -327,13 +327,25 @@
 
     /**
      * Fetch a URL via GM_xmlhttpRequest (bypasses CORS).
+     * Automatically includes Referer and Origin headers matching the current page
+     * so that streaming servers that check these headers (a common anti-hotlinking
+     * measure) accept the request without requiring the page's native fetch.
+     * Callers may override these headers by passing them explicitly in opts.headers.
      * @param {string} url
      * @param {{ method?: string, responseType?: string, headers?: object, rangeStart?: number, rangeEnd?: number }} [opts]
      * @returns {Promise<{status: number, response: any, responseText: string}>}
      */
     function gmFetch(url, opts = {}) {
         const { method = 'GET', responseType = 'text', headers = {}, rangeStart, rangeEnd } = opts;
-        const reqHeaders = Object.assign({}, headers);
+        // Inject Referer and Origin so the request looks like it came from the page.
+        // GM_xmlhttpRequest is allowed to set these privileged headers (unlike XHR),
+        // and many streaming servers (including hotlivethai.net) began enforcing
+        // Referer checks on HLS playlist and segment requests.  Callers can still
+        // override these by including them in opts.headers.
+        const reqHeaders = Object.assign(
+            { Referer: location.href, Origin: location.origin },
+            headers
+        );
         if (rangeStart !== undefined) {
             const end = rangeEnd !== undefined ? rangeEnd : '';
             reqHeaders['Range'] = `bytes=${rangeStart}-${end}`;
@@ -582,14 +594,6 @@
      * Download an HLS stream segment-by-segment, writing each segment directly to
      * the FileSystemWritableFileStream so nothing large stays in memory.
      *
-     * GM_xmlhttpRequest is tried first for every playlist and segment fetch.  If
-     * it returns 403 (e.g. because it bypasses a VPN browser extension and the
-     * streaming server has recently tightened IP-session validation), the request
-     * is retried via the page's native fetch, which runs in the full browser
-     * context and is routed through any active VPN or proxy extension.  Once the
-     * playlist falls back to page fetch, all subsequent polls also use page fetch
-     * so we don't keep bouncing between the two paths.
-     *
      * @param {string} url - URL of the m3u8 playlist (master or media).
      * @param {FileSystemFileHandle} fileHandle
      * @param {function(number): void} onProgress - called with bytes written per chunk
@@ -604,34 +608,11 @@
         let targetDuration = 5;
         let consecutiveErrors = 0;
 
-        // Helper: fetch playlist text via the page's native fetch.
-        // Runs in the full browser context (VPN extension, cookies, Referer) and is
-        // used as a fallback when GM_xmlhttpRequest is blocked by the streaming server.
-        const fetchPlaylistViaPageFetch = async (purl) => {
-            const response = await _fetch.call(_win, purl);
-            if (!response.ok) throw new Error(`HTTP ${response.status} for ${purl}`);
-            return response.text();
-        };
-
         try {
             // Resolve master playlist to the best-quality media playlist URL.
             let mediaURL = url;
-            // Once playlist fetching has fallen back to page fetch, keep using it for
-            // all subsequent polls — avoids re-trying the blocked GM path on every tick.
-            let usePageFetchForPlaylist = false;
-
-            // Fetch the initial master/media playlist, falling back to page fetch on 403.
-            let initialText;
-            try {
-                const initial = await gmFetch(url);
-                initialText = initial.responseText;
-            } catch (e) {
-                if (!e.isGmForbidden && !e.isGmNetworkError) throw e;
-                dbg('HLS: initial gmFetch blocked (%s), falling back to page fetch', e.message);
-                initialText = await fetchPlaylistViaPageFetch(url);
-                usePageFetchForPlaylist = true;
-            }
-            const initialParsed = parseM3U8(initialText, url);
+            const initial = await gmFetch(url);
+            const initialParsed = parseM3U8(initial.responseText, url);
             if (initialParsed.type === 'master') {
                 if (initialParsed.streams.length === 0) throw new Error('No streams found in master playlist');
                 mediaURL = initialParsed.streams[0].uri; // highest bandwidth
@@ -640,37 +621,14 @@
             while (!stopSignal.stopped) {
                 let playlistText;
                 try {
-                    if (usePageFetchForPlaylist) {
-                        playlistText = await fetchPlaylistViaPageFetch(mediaURL);
-                    } else {
-                        const r = await gmFetch(mediaURL);
-                        playlistText = r.responseText;
-                    }
+                    const r = await gmFetch(mediaURL);
+                    playlistText = r.responseText;
                     consecutiveErrors = 0;
                 } catch (e) {
-                    // e.isGmForbidden / e.isGmNetworkError are set by gmFetch() (see gmFetch
-                    // implementation) to distinguish 403s and network failures from other errors.
-                    // GM blocked (403 / network error) — try page fetch once, then
-                    // keep using it for all future playlist polls.
-                    if (!usePageFetchForPlaylist && (e.isGmForbidden || e.isGmNetworkError)) {
-                        dbg('HLS: playlist gmFetch blocked (%s), falling back to page fetch', e.message);
-                        try {
-                            playlistText = await fetchPlaylistViaPageFetch(mediaURL);
-                            usePageFetchForPlaylist = true;
-                            consecutiveErrors = 0;
-                        } catch (pageFetchErr) {
-                            dbg('HLS: page fetch also failed: %s', pageFetchErr?.message);
-                        }
-                    }
-                    // playlistText is set only when a fetch succeeded above.  When it is
-                    // still falsy (both paths failed, or the error was not a 403/network
-                    // error), apply the same retry-up-to-5 logic as the original code.
-                    if (!playlistText) {
-                        consecutiveErrors++;
-                        if (consecutiveErrors > 5) throw e;
-                        await sleep(targetDuration * 1000);
-                        continue;
-                    }
+                    consecutiveErrors++;
+                    if (consecutiveErrors > 5) throw e;
+                    await sleep(targetDuration * 1000);
+                    continue;
                 }
 
                 const playlist = parseM3U8(playlistText, mediaURL);
@@ -687,27 +645,7 @@
                         lastDownloadedSequence = seg.sequence;
                         onProgress(segResp.response.byteLength);
                     } catch (e) {
-                        if (e.isGmForbidden || e.isGmNetworkError) {
-                            // GM blocked — fall back to page fetch for this segment.
-                            // The page fetch runs through the VPN extension so the
-                            // streaming server sees the same IP as the player session.
-                            try {
-                                dbg('HLS: segment gmFetch blocked (%s), trying page fetch for %s', e.message, seg.uri);
-                                const segResponse = await _fetch.call(_win, seg.uri);
-                                if (segResponse.ok) {
-                                    const buf = await segResponse.arrayBuffer();
-                                    await writer.write(buf);
-                                    lastDownloadedSequence = seg.sequence;
-                                    onProgress(buf.byteLength);
-                                } else {
-                                    console.warn('[LivestreamRecorder] Skipping segment, page fetch returned HTTP', segResponse.status, seg.uri);
-                                }
-                            } catch (pageFetchErr) {
-                                console.warn('[LivestreamRecorder] Skipping segment, page fetch also failed:', seg.uri, pageFetchErr?.message);
-                            }
-                        } else {
-                            console.warn('[LivestreamRecorder] Skipping segment after error:', seg.uri, e.message);
-                        }
+                        console.warn('[LivestreamRecorder] Skipping segment after error:', seg.uri, e.message);
                     }
                 }
 
