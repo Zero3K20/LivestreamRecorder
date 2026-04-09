@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Livestream Recorder
 // @namespace    https://github.com/Zero3K20/LivestreamRecorder
-// @version      1.4.29
+// @version      1.4.30
 // @description  Record and download m3u8/flv/mp4/etc. live streams and WebSocket binary streams directly to disk without buffering in memory. Supports multiple concurrent downloads and a user-selected save directory.
 // @author       Zero3K20
 // @match        *://*/*
@@ -594,6 +594,7 @@
         // Track downloaded segment sequence numbers to avoid duplicates on live playlists.
         let lastDownloadedSequence = -1;
         let targetDuration = 5;
+        let lastSegDuration = targetDuration;
         let consecutiveErrors = 0;
 
         try {
@@ -604,6 +605,11 @@
             if (initialParsed.type === 'master') {
                 if (initialParsed.streams.length === 0) throw new Error('No streams found in master playlist');
                 mediaURL = initialParsed.streams[0].uri; // highest bandwidth
+            } else {
+                // Seed timing from the media playlist so the very first sleep uses the
+                // correct duration rather than the hardcoded 5 s default.
+                targetDuration = initialParsed.targetDuration;
+                lastSegDuration = targetDuration;
             }
 
             while (!stopSignal.stopped) {
@@ -622,6 +628,7 @@
                 const playlist = parseM3U8(playlistText, mediaURL);
                 targetDuration = playlist.targetDuration;
 
+                let newSegments = 0;
                 for (const seg of playlist.segments) {
                     if (stopSignal.stopped) break;
                     if (seg.sequence <= lastDownloadedSequence) continue;
@@ -631,6 +638,8 @@
                         // Write directly to disk; the ArrayBuffer is released after this await.
                         await writer.write(segResp.response);
                         lastDownloadedSequence = seg.sequence;
+                        lastSegDuration = seg.duration;
+                        newSegments++;
                         onProgress(segResp.response.byteLength);
                     } catch (e) {
                         console.warn('[LivestreamRecorder] Skipping segment after error:', seg.uri, e.message);
@@ -639,8 +648,11 @@
 
                 if (playlist.isEndList) break;
 
-                // Poll again after half the target-duration window.
-                await sleep((targetDuration / 2) * 1000);
+                // If we downloaded new segments, the next one won't be ready for roughly
+                // one segment duration — sleep that long to avoid a guaranteed-empty poll.
+                // If nothing new was found we're waiting for the server to produce the next
+                // segment, so poll more aggressively at half the target-duration window.
+                await sleep((newSegments > 0 ? lastSegDuration : targetDuration / 2) * 1000);
             }
         } finally {
             await writer.close();
