@@ -10,6 +10,7 @@
     const STREAM_MIME_RE = /video\/x-flv|video\/mp2t|application\/(x-mpegurl|vnd\.apple\.mpegurl)/i;
     const WS_STREAM_RE   = /\.(flv|ts|m4s|mp4|aac)(\?|$)/i;
     const STREAM_RE      = /\.(m3u8|flv|mpd|ts)(\?|$)/i;
+    const RTMP_RE        = /^rtmps?:\/\//i;
     const M3U8_URL_RE    = /\.m3u8(\?|#|$)/i;
     const TS_URL_RE      = /\.ts(\?|#|$)/i;
 
@@ -25,7 +26,27 @@
     }
 
     function isStreamURL(url) {
-        return typeof url === 'string' && STREAM_RE.test(url);
+        if (typeof url !== 'string') return false;
+        // rtmp:// / rtmps:// URLs are always treated as streams.
+        if (RTMP_RE.test(url)) return true;
+        return STREAM_RE.test(url);
+    }
+
+    /**
+     * For pull.cdnsi.com HTTPS FLV URLs, return the RTMP equivalent.
+     * This lets the recorder use the HTTP-FLV endpoint (derived from RTMP)
+     * instead of the HTTPS endpoint for better reliability.
+     * @param {string} url
+     * @returns {string|null} RTMP URL, or null if not applicable.
+     */
+    function cdnsiToRtmp(url) {
+        try {
+            const u = new URL(url);
+            if (!/pull\.cdnsi\.com$/i.test(u.hostname)) return null;
+            if (u.protocol !== 'https:') return null;
+            const pathname = u.pathname.replace(/\.flv$/i, '');
+            return `rtmp://${u.host}${pathname}${u.search}`;
+        } catch { return null; }
     }
 
     function isWSStreamURL(url) {

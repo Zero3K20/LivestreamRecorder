@@ -1264,16 +1264,18 @@
         const mime = streamMimeTypes.get(url) || '';
         const isWS     = /^wss?:\/\//i.test(url);
         const isWebRTC = url.startsWith('webrtc://');
-        const isHLS    = !isWS && !isWebRTC && (/\.m3u8(\?|$)/i.test(url) || /[?&].*m3u8/i.test(url) ||
+        const isRTMP   = isRTMPStreamURL(url);
+        const isHLS    = !isWS && !isWebRTC && !isRTMP && (/\.m3u8(\?|$)/i.test(url) || /[?&].*m3u8/i.test(url) ||
                           /application\/(x-mpegurl|vnd\.apple\.mpegurl)/i.test(mime));
-        let ext = isHLS ? 'ts' : isWebRTC ? 'webm' : 'mp4';
+        // RTMP URLs are downloaded as HTTP-FLV; use .flv extension.
+        let ext = isHLS ? 'ts' : isWebRTC ? 'webm' : isRTMP ? 'flv' : 'mp4';
         if (isWS) {
             try {
                 const pathname = new URL(url).pathname;
                 const raw = pathname.split('.').pop().split('?')[0].toLowerCase();
                 ext = /^[a-z0-9]{2,5}$/.test(raw) ? raw : 'bin';
             } catch { ext = 'bin'; }
-        } else if (!isHLS && !isWebRTC) {
+        } else if (!isHLS && !isWebRTC && !isRTMP) {
             if (/video\/x-flv/i.test(mime)) {
                 ext = 'flv';
             } else {
@@ -1295,6 +1297,7 @@
             isHLS,
             isWS,
             isWebRTC,
+            isRTMP,
             status: 'downloading',
             bytesWritten: 0,
             stopSignal,
@@ -1320,6 +1323,14 @@
                 await downloadWebSocket(url, fileHandle, onProgress, stopSignal);
             } else if (isWebRTC) {
                 await downloadMediaRecorder(url, fileHandle, onProgress, stopSignal);
+            } else if (isRTMP) {
+                // Browsers cannot connect to RTMP directly.  Convert the RTMP URL to
+                // its HTTP-FLV equivalent (same host/path, http:// scheme, .flv extension)
+                // and download as a direct HTTP stream.
+                const httpFlvUrl = convertRtmpToHttpFlv(url);
+                if (!httpFlvUrl) throw new Error('Could not convert RTMP URL to HTTP-FLV: ' + url);
+                dbg('RTMP: converted %s → %s', url, httpFlvUrl);
+                await downloadDirect(httpFlvUrl, fileHandle, onProgress, stopSignal);
             } else {
                 await downloadDirect(url, fileHandle, onProgress, stopSignal);
             }
@@ -1342,6 +1353,8 @@
 
     function isStreamURL(url) {
         if (typeof url !== 'string') return false;
+        // rtmp:// / rtmps:// URLs are always treated as streams.
+        if (/^rtmps?:\/\//i.test(url)) return true;
         if (STREAM_RE.test(url)) return true;
         // Scan decoded query-parameter values for embedded stream filenames,
         // e.g. ?stream=roomid.flv&token=xxx  or  ?url=https%3A%2F%2Fcdn%2Fstream.flv
@@ -1363,6 +1376,55 @@
         return WS_STREAM_RE.test(url) || /\/(live|stream|push|play|video)\//i.test(url);
     }
 
+    /** Returns true for rtmp:// / rtmps:// stream URLs. */
+    function isRTMPStreamURL(url) {
+        return typeof url === 'string' && /^rtmps?:\/\//i.test(url);
+    }
+
+    /**
+     * Convert an RTMP/RTMPS URL to an equivalent HTTP-FLV URL for download.
+     *
+     * RTMP CDNs (e.g. pull.cdnsi.com) typically serve the same stream over
+     * both RTMP and HTTP-FLV.  The mapping is:
+     *   rtmp://host/live/STREAM_ID[?q]  →  http://host/live/STREAM_ID.flv[?q]
+     *   rtmps://host/live/STREAM_ID[?q] → https://host/live/STREAM_ID.flv[?q]
+     *
+     * @param {string} rtmpUrl
+     * @returns {string|null} HTTP-FLV URL, or null if the input is not a valid RTMP URL.
+     */
+    function convertRtmpToHttpFlv(rtmpUrl) {
+        try {
+            const u = new URL(rtmpUrl);
+            if (!/^rtmps?:$/i.test(u.protocol)) return null;
+            const scheme   = u.protocol === 'rtmps:' ? 'https' : 'http';
+            // Append .flv if not already present so the CDN serves the FLV container.
+            const pathname = /\.flv$/i.test(u.pathname) ? u.pathname : u.pathname + '.flv';
+            return `${scheme}://${u.host}${pathname}${u.search}`;
+        } catch { return null; }
+    }
+
+    /**
+     * Convert an HTTPS FLV URL from pull.cdnsi.com to its RTMP equivalent.
+     * This lets the recorder use the HTTP-FLV endpoint (derived from the RTMP URL)
+     * instead of the original HTTPS endpoint, which may be more reliably accessible.
+     *
+     * Mapping: https://pull.cdnsi.com/live/STREAM.flv[?q]
+     *        → rtmp://pull.cdnsi.com/live/STREAM[?q]
+     *
+     * @param {string} url  Original HTTPS URL from pull.cdnsi.com.
+     * @returns {string|null} RTMP URL, or null if not applicable.
+     */
+    function convertCdnsiToRtmp(url) {
+        try {
+            const u = new URL(url);
+            if (!/pull\.cdnsi\.com$/i.test(u.hostname)) return null;
+            if (u.protocol !== 'https:') return null;
+            // Strip .flv extension; RTMP URLs use the bare stream name.
+            const pathname = u.pathname.replace(/\.flv$/i, '');
+            return `rtmp://${u.host}${pathname}${u.search}`;
+        } catch { return null; }
+    }
+
     /**
      * Add a stream URL to the detected list.
      * Suppresses individual .ts segments when the parent .m3u8 playlist has already
@@ -1371,7 +1433,18 @@
      * @param {string} [mimeType]
      */
     function addDetectedStream(url, mimeType) {
-        if (typeof url !== 'string' || !/^(https?|wss?|webrtc):/.test(url)) return;
+        if (typeof url !== 'string' || !/^(https?|wss?|webrtc|rtmps?):/.test(url)) return;
+
+        // For pull.cdnsi.com HTTPS FLV URLs, substitute the RTMP equivalent so the
+        // recorder uses the HTTP-FLV endpoint (converted from RTMP at download time)
+        // instead of the HTTPS endpoint.  This is more reliably accessible on CDNs
+        // that restrict HTTPS streaming to in-player sessions.
+        const cdnsiRtmp = convertCdnsiToRtmp(url);
+        if (cdnsiRtmp) {
+            // Recurse with the RTMP URL; the original HTTPS URL is not added.
+            addDetectedStream(cdnsiRtmp, mimeType);
+            return;
+        }
 
         const isM3U8 = /\.m3u8(\?|$)/i.test(url);
         const isTS   = /\.ts(\?|$)/i.test(url);
@@ -1462,7 +1535,8 @@
      * @param {string} text
      */
     function scanTextForStreamURLs(text) {
-        const re = /https?:\/\/[^\s"'<>\\{}[\]|^`\x00-\x1f]{5,}/gi;
+        // Match http://, https://, rtmp://, and rtmps:// URLs.
+        const re = /(?:https?|rtmps?):\/\/[^\s"'<>\\{}[\]|^`\x00-\x1f]{5,}/gi;
         let m;
         while ((m = re.exec(text)) !== null) {
             try {
@@ -2247,6 +2321,7 @@ return p;
             isHLS:        dl.isHLS,
             isWS:         dl.isWS,
             isWebRTC:     dl.isWebRTC,
+            isRTMP:       dl.isRTMP,
             status:       dl.status,
             bytesWritten: dl.bytesWritten,
         }));
@@ -2265,6 +2340,7 @@ return p;
             isHLS:        dl.isHLS,
             isWS:         dl.isWS,
             isWebRTC:     dl.isWebRTC,
+            isRTMP:       dl.isRTMP,
             status:       dl.status,
             bytesWritten: dl.bytesWritten,
         }));
@@ -2335,6 +2411,7 @@ return p;
                     isHLS:        saved.isHLS,
                     isWS:         saved.isWS,
                     isWebRTC:     saved.isWebRTC,
+                    isRTMP:       saved.isRTMP,
                     status:       'downloading',
                     bytesWritten: saved.bytesWritten,
                     stopSignal,
@@ -2385,6 +2462,11 @@ return p;
             if (dl.isHLS) {
                 await downloadHLS(dl.url, fileHandle, onProgress, dl.stopSignal,
                     { keepExisting: true, seekOffset: startOffset });
+            } else if (dl.isRTMP) {
+                const httpFlvUrl = convertRtmpToHttpFlv(dl.url);
+                if (!httpFlvUrl) throw new Error('Could not convert RTMP URL to HTTP-FLV: ' + dl.url);
+                await downloadDirect(httpFlvUrl, fileHandle, onProgress, dl.stopSignal,
+                    { startOffset });
             } else {
                 await downloadDirect(dl.url, fileHandle, onProgress, dl.stopSignal,
                     { startOffset });
@@ -2653,7 +2735,7 @@ return p;
         } else {
             elDetected.innerHTML = '';
             for (const url of detectedStreams) {
-                const short = url.replace(/^https?:\/\//, '').substring(0, MAX_DISPLAYED_URL_LENGTH);
+                const short = url.replace(/^(?:https?|rtmps?):\/\//, '').substring(0, MAX_DISPLAYED_URL_LENGTH);
                 const item = document.createElement('div');
                 item.className = 'lsr-stream-item';
                 item.innerHTML =

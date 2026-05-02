@@ -101,7 +101,24 @@ async function getWritable(filename) {
     return { writable: await opfsGetWritable(filename), savedToDir: false };
 }
 
-// ─── Background notification ──────────────────────────────────────────────────
+/**
+ * Convert an RTMP/RTMPS URL to an equivalent HTTP-FLV URL for download.
+ * rtmp://host/live/STREAM_ID[?q]  →  http://host/live/STREAM_ID.flv[?q]
+ * rtmps://host/live/STREAM_ID[?q] → https://host/live/STREAM_ID.flv[?q]
+ * @param {string} rtmpUrl
+ * @returns {string|null}
+ */
+function convertRtmpToHttpFlv(rtmpUrl) {
+    try {
+        const u = new URL(rtmpUrl);
+        if (!/^rtmps?:$/i.test(u.protocol)) return null;
+        const scheme   = u.protocol === 'rtmps:' ? 'https' : 'http';
+        const pathname = /\.flv$/i.test(u.pathname) ? u.pathname : u.pathname + '.flv';
+        return `${scheme}://${u.host}${pathname}${u.search}`;
+    } catch { return null; }
+}
+
+
 
 /** Fire-and-forget message to the background service worker. */
 function notifyBg(msg) {
@@ -234,7 +251,7 @@ async function dlWebSocket(url, id, stopSignal, writable) {
 
 // ─── Download entry point ─────────────────────────────────────────────────────
 
-async function handleStartDownload({ id, url, filename, isHLS, isWS }) {
+async function handleStartDownload({ id, url, filename, isHLS, isWS, isRTMP }) {
     const stopSignal = { stopped: false };
     activeOps.set(id, { stopSignal });
     let writable = null;
@@ -246,9 +263,16 @@ async function handleStartDownload({ id, url, filename, isHLS, isWS }) {
         const w = writable;
         writable = null; // downloader owns the writable and closes it in its finally block
 
-        if (isHLS)     await dlHLS(url, id, stopSignal, w);
-        else if (isWS) await dlWebSocket(url, id, stopSignal, w);
-        else           await dlDirect(url, id, stopSignal, w);
+        if (isHLS)       await dlHLS(url, id, stopSignal, w);
+        else if (isWS)   await dlWebSocket(url, id, stopSignal, w);
+        else if (isRTMP) {
+            // Browsers cannot connect to RTMP directly.  Convert to HTTP-FLV and
+            // download as a regular direct stream.
+            const httpFlvUrl = convertRtmpToHttpFlv(url);
+            if (!httpFlvUrl) throw new Error('Could not convert RTMP URL to HTTP-FLV: ' + url);
+            await dlDirect(httpFlvUrl, id, stopSignal, w);
+        }
+        else             await dlDirect(url, id, stopSignal, w);
 
         notifyBg({ type: 'patchDownload', id, patch: { status: stopSignal.stopped ? 'stopped' : 'completed' } });
 

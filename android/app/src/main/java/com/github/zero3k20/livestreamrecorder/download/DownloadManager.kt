@@ -45,10 +45,17 @@ class DownloadManager(context: Context) {
         val job = scope.launch {
             callback.onProgress(stream.id, DownloadState.Downloading())
 
+            // RTMP streams are downloaded via HTTP-FLV (same CDN, http:// scheme, .flv ext).
+            val effectiveUrl = if (stream.type.equals("rtmp", ignoreCase = true)) {
+                StreamDetector.rtmpToHttpFlv(stream.url) ?: stream.url
+            } else {
+                stream.url
+            }
+
             when (stream.type.lowercase()) {
                 "hls" -> {
                     HlsDownloader().download(
-                        playlistUrl = stream.url,
+                        playlistUrl = effectiveUrl,
                         outputFile  = outputFile,
                         onProgress  = { bytes, segs, total ->
                             callback.onProgress(
@@ -65,7 +72,7 @@ class DownloadManager(context: Context) {
                 }
                 else -> {
                     DirectDownloader().download(
-                        streamUrl  = stream.url,
+                        streamUrl  = effectiveUrl,
                         outputFile = outputFile,
                         onProgress = { bytes, total ->
                             callback.onProgress(
@@ -112,7 +119,7 @@ class DownloadManager(context: Context) {
         val timestamp = System.currentTimeMillis()
         val ext = when (stream.type.lowercase()) {
             "hls"       -> "ts"
-            "flv"       -> "flv"
+            "flv", "rtmp" -> "flv"
             "mp4"       -> "mp4"
             "webm"      -> "webm"
             "websocket" -> "ts"

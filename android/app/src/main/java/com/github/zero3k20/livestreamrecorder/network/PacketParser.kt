@@ -169,7 +169,7 @@ object PacketParser {
         return buf
     }
 
-    // ── HTTP / TLS stream detection ───────────────────────────────────────────
+    // ── HTTP / TLS / RTMP stream detection ───────────────────────────────────────
 
     /**
      * Returns (url, type) if [data] looks like the start of an HTTP request
@@ -225,6 +225,55 @@ object PacketParser {
                 return null
             }
             pos += extLen
+        }
+        return null
+    }
+
+    /**
+     * Attempt to extract the `tcUrl` field from an RTMP C0+C1+C2 handshake or
+     * connect command payload.
+     *
+     * RTMP handshake: C0 (1 byte version = 0x03) + C1 (1536 bytes random) = 1537 bytes
+     * before any AMF0 data arrives.  Once the handshake completes, the client sends
+     * a `connect` AMF0 command whose first property is `tcUrl` (the stream URL).
+     *
+     * Parsing full AMF0 is complex; instead we scan the raw bytes for the ASCII
+     * string `"tcUrl"` followed by the AMF0 string type (0x02) and a 2-byte length,
+     * then read the value.  This heuristic is robust against padding variations.
+     *
+     * Falls back to building a bare `rtmp://host/` URL from [serverAddr] when no
+     * `tcUrl` is found (e.g. during the C0/C1 handshake phase).
+     *
+     * @param data       Raw TCP payload bytes.
+     * @param serverAddr 4-byte destination IP address.
+     * @return Extracted RTMP stream URL, or null if the data cannot be parsed.
+     */
+    fun extractRtmpUrl(data: ByteArray, serverAddr: ByteArray): String? {
+        if (data.size < 2) return null
+        val text = try { String(data, Charsets.ISO_8859_1) } catch (_: Exception) { return null }
+
+        // Search for the "tcUrl" key in the AMF0 connect command.
+        // AMF0 key format: 2-byte length (big-endian) + UTF-8 characters.
+        // We search for the key name bytes directly for simplicity.
+        val tcUrlKey = "tcUrl"
+        var pos = text.indexOf(tcUrlKey)
+        while (pos >= 0) {
+            // After the key name comes: AMF0 type (1 byte), then for type=0x02 (String):
+            //   2-byte length + string bytes.
+            val valStart = pos + tcUrlKey.length
+            if (valStart + 3 < data.size && data[valStart] == 0x02.toByte()) {
+                val strLen = (u8(data, valStart + 1) shl 8) or u8(data, valStart + 2)
+                val strStart = valStart + 3
+                if (strLen > 0 && strStart + strLen <= data.size) {
+                    val candidate = try {
+                        String(data, strStart, strLen, Charsets.UTF_8)
+                    } catch (_: Exception) { null }
+                    if (candidate != null && candidate.startsWith("rtmp", ignoreCase = true)) {
+                        return candidate
+                    }
+                }
+            }
+            pos = text.indexOf(tcUrlKey, pos + 1)
         }
         return null
     }
