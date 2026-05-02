@@ -127,18 +127,36 @@ function notifyBg(msg) {
     chrome.runtime.sendMessage({ target: 'background', ...msg }).catch(() => {});
 }
 
+/**
+ * Derive an HTTP-FLV URL from a parsed RTMP URL.
+ * rtmp://host/app/stream → http://host/app/stream.flv
+ * rtmps://host/app/stream → https://host/app/stream.flv
+ * @param {{ scheme: string, host: string, app: string, streamName: string }} p
+ * @returns {string}
+ */
+function _rtmpToHttpFlv(p) {
+    const httpScheme = p.scheme === 'rtmps' ? 'https' : 'http';
+    const path = p.streamName ? `/${p.app}/${p.streamName}.flv` : `/${p.app}.flv`;
+    return `${httpScheme}://${p.host}${path}`;
+}
+
 // ─── RTMP / RTMPT downloader ──────────────────────────────────────────────────
 
 /**
- * Download an RTMP live stream using RTMPT (RTMP Tunneled over HTTP).
- * RTMPT is the standard HTTP-compatible RTMP transport defined in the Adobe
- * RTMP spec: it wraps the identical RTMP binary protocol in HTTP POST requests.
- * This means the recorder uses real RTMP framing (not a URL-converted endpoint)
- * so that HTTPS 403 restrictions on the CDN are bypassed at the protocol level.
+ * Download an RTMP live stream.
  *
- * RTMPT base URL mapping:
- *   rtmp://host:1935/app/stream → http://host:80/open/1 (RTMPT)
- *   rtmps://host:443/app/stream → https://host:443/open/1 (RTMPTS)
+ * Strategy:
+ *   1. Probe the RTMPT endpoint (POST /open/1) to check whether the server
+ *      supports RTMPT (RTMP Tunneled over HTTP).  This check happens before any
+ *      data is written to the file, so we can still change course cleanly.
+ *   2a. If the probe returns a valid session ID → run the full RTMPT protocol.
+ *       RTMPT uses the same RTMP binary framing over HTTP POST requests and is
+ *       the only browser-native way to speak RTMP.
+ *   2b. If the probe fails (server doesn't support RTMPT, empty body, HTTP error)
+ *       → fall back to HTTP-FLV: a standard HTTP GET that streams raw FLV data.
+ *       The HTTP-FLV endpoint (http://host/app/stream.flv) is a separate access
+ *       method from the original HTTPS endpoint that may have returned 403, so
+ *       this fallback has a genuine chance of succeeding.
  *
  * @param {string}                          url        rtmp[s]:// URL
  * @param {number}                          id         download ID (for notifyBg)
@@ -155,6 +173,33 @@ async function dlRTMP(url, id, stopSignal, writable) {
     const httpScheme = (scheme === 'rtmps') ? 'https' : 'http';
     const httpPort   = (scheme === 'rtmps') ? 443 : 80;
     const base       = `${httpScheme}://${host}:${httpPort}`;
+
+    // ── Step 1: Probe RTMPT — must happen BEFORE writing anything to the file ──
+    let sessionId = null;
+    try {
+        const r = await fetch(`${base}/open/1`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/x-fcs', 'User-Agent': 'Shockwave Flash' },
+        });
+        if (r.ok) {
+            const raw = new TextDecoder().decode(new Uint8Array(await r.arrayBuffer())).trim();
+            // A valid RTMPT session ID is a short alphanumeric string, never HTML.
+            const MAX_SESSION_ID_LENGTH = 128;
+            if (raw && !raw.startsWith('<') && raw.length < MAX_SESSION_ID_LENGTH) sessionId = raw;
+        }
+    } catch { /* probe failed — network error or connection refused */ }
+
+    // ── Step 2b: HTTP-FLV fallback ──────────────────────────────────────────────
+    if (!sessionId) {
+        console.warn('[LSR] RTMPT not supported by server, falling back to HTTP-FLV');
+        const httpFlvUrl = _rtmpToHttpFlv(parsed);
+        // dlDirect owns the writable and closes it in its own finally block.
+        await dlDirect(httpFlvUrl, id, stopSignal, writable);
+        return;
+    }
+
+    // ── Step 2a: Full RTMPT protocol ────────────────────────────────────────────
+    console.debug('[LSR] RTMPT session:', sessionId);
 
     // ── Binary helpers ──────────────────────────────────────────────────────────
     const concat = (...arrs) => {
@@ -298,12 +343,8 @@ async function dlRTMP(url, id, stopSignal, writable) {
     };
 
     // ── Session ──────────────────────────────────────────────────────────────────
+    // sessionId was already obtained from the probe above; proceed directly.
     let bytesWritten = 0;
-
-    // 1. Open session
-    const sessionId = new TextDecoder().decode(await rtmptPost('/open/1', null)).trim();
-    if (!sessionId) throw new Error('RTMPT: empty session ID');
-
     let seqNum = 0;
     let accumBuf = new Uint8Array(0);
 
@@ -528,9 +569,8 @@ async function handleStartDownload({ id, url, filename, isHLS, isWS, isRTMP }) {
         if (isHLS)       await dlHLS(url, id, stopSignal, w);
         else if (isWS)   await dlWebSocket(url, id, stopSignal, w);
         else if (isRTMP) {
-            // Download via RTMPT (RTMP Tunneled over HTTP), the standard browser-
-            // compatible RTMP transport.  This uses the actual RTMP protocol framing
-            // without any URL conversion, so HTTPS 403 restrictions are bypassed.
+            // Try RTMPT first; if the server doesn't support it, dlRTMP falls
+            // back automatically to HTTP-FLV (same writable, nothing written yet).
             await dlRTMP(url, id, stopSignal, w);
         }
         else             await dlDirect(url, id, stopSignal, w);

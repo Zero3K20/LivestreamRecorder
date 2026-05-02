@@ -1229,20 +1229,36 @@
     // ─── RTMP / RTMPT downloader ───────────────────────────────────────────────────
 
     /**
-     * Download a live stream from an rtmp:// or rtmps:// URL using RTMPT
-     * (RTMP Tunneled over HTTP — RFC-compatible transport that wraps the RTMP
-     * binary protocol in HTTP POST requests, the only RTMP-compatible transport
-     * available in a browser without native TCP socket access).
+     * Derive an HTTP-FLV URL from a parsed RTMP URL.
+     * rtmp://host/app/stream → http://host/app/stream.flv
+     * rtmps://host/app/stream → https://host/app/stream.flv
+     * @param {{ scheme: string, host: string, app: string, streamName: string }} p
+     * @returns {string}
+     */
+    function _rtmpToHttpFlv(p) {
+        const httpScheme = p.scheme === 'rtmps' ? 'https' : 'http';
+        const path = p.streamName ? `/${p.app}/${p.streamName}.flv` : `/${p.app}.flv`;
+        return `${httpScheme}://${p.host}${path}`;
+    }
+
+    /**
+     * Download a live stream from an rtmp:// or rtmps:// URL.
      *
-     * RTMPT session flow:
+     * Strategy:
+     *   1. Probe the RTMPT endpoint (POST /open/1) BEFORE opening the file writer,
+     *      so we can still change course cleanly if the server doesn't support RTMPT.
+     *   2a. Valid session ID → run full RTMPT protocol (RTMP binary framing over
+     *       HTTP POST requests — the only browser-native RTMP transport).
+     *   2b. No session ID → fall back to HTTP-FLV: a standard streaming HTTP GET
+     *       (http://host/app/stream.flv).  This is a separate endpoint from the
+     *       original HTTPS URL that may have returned 403, so this path has a
+     *       genuine chance of succeeding.
+     *
+     * RTMPT session flow (when the server supports it):
      *   POST /open/1              → session ID
      *   POST /send/SID/N  (body=C0+C1)  → S0+S1+S2
      *   POST /send/SID/N  (body=C2+connect+createStream+play)  → server responses
      *   POST /idle/SID/N  repeatedly   → audio/video chunks  (written as FLV)
-     *
-     * Each RTMPT response body starts with a 1-byte polling-interval hint followed
-     * by raw RTMP bytes.  We ignore the interval and poll as fast as the stop signal
-     * allows.
      *
      * @param {string}                   rtmpUrl    rtmp[s]:// URL to download
      * @param {FileSystemFileHandle}     fileHandle destination file
@@ -1259,6 +1275,45 @@
         const httpScheme = (scheme === 'rtmps') ? 'https' : 'http';
         const httpPort   = (scheme === 'rtmps') ? 443 : 80;
         const base       = `${httpScheme}://${host}:${httpPort}`;
+
+        // ── Step 1: Probe RTMPT endpoint (before opening the file writer) ────────
+        // GM_xmlhttpRequest bypasses CORS and mixed-content restrictions.
+        const RTMPT_PROBE_TIMEOUT_MS = 8000;
+        const MAX_SESSION_ID_LENGTH  = 128;
+        const sessionId = await new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method:       'POST',
+                url:          base + '/open/1',
+                headers:      { 'Content-Type': 'application/x-fcs', 'User-Agent': 'Shockwave Flash' },
+                responseType: 'arraybuffer',
+                timeout:      RTMPT_PROBE_TIMEOUT_MS,
+                onload(r) {
+                    if (r.status >= 200 && r.status < 300) {
+                        const raw = new TextDecoder().decode(
+                            new Uint8Array(r.response || new ArrayBuffer(0)),
+                        ).trim();
+                        // A valid RTMPT session ID is a short non-HTML string.
+                        resolve((raw && !raw.startsWith('<') && raw.length < MAX_SESSION_ID_LENGTH) ? raw : null);
+                    } else {
+                        resolve(null); // HTTP error → server doesn't support RTMPT
+                    }
+                },
+                onerror()   { resolve(null); },
+                ontimeout() { resolve(null); },
+            });
+        });
+
+        // ── Step 2b: HTTP-FLV fallback ────────────────────────────────────────────
+        if (!sessionId) {
+            dbg('RTMPT not supported by server, falling back to HTTP-FLV');
+            const httpFlvUrl = _rtmpToHttpFlv(parsed);
+            await downloadDirect(httpFlvUrl, fileHandle, onProgress, stopSignal);
+            return;
+        }
+
+        dbg('RTMPT session: %s', sessionId);
+
+        // ── Step 2a: Full RTMPT protocol ──────────────────────────────────────────
 
         // ── Binary helpers ──────────────────────────────────────────────────────
         const concat = (...arrs) => {
@@ -1476,18 +1531,9 @@
         }
 
         // ── State machine ────────────────────────────────────────────────────────
+        // sessionId was already obtained from the probe above; proceed directly.
         const writer = await _makeFlushingWriter(fileHandle);
         try {
-            // 1. Open RTMPT session
-            let sessionId;
-            {
-                const resp = await rtmptPost('/open/1', null);
-                // Response: "SESSION_ID\r\n" — decode text
-                sessionId = new TextDecoder().decode(resp).trim();
-                if (!sessionId) throw new Error('RTMPT: empty session ID from /open/1');
-                dbg('RTMPT session:', sessionId);
-            }
-
             let seqNum = 0;
             let accumBuf = new Uint8Array(0); // accumulates incoming RTMP bytes across polls
 
