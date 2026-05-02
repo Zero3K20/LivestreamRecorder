@@ -45,17 +45,10 @@ class DownloadManager(context: Context) {
         val job = scope.launch {
             callback.onProgress(stream.id, DownloadState.Downloading())
 
-            // RTMP streams are downloaded via HTTP-FLV (same CDN, http:// scheme, .flv ext).
-            val effectiveUrl = if (stream.type.equals("rtmp", ignoreCase = true)) {
-                StreamDetector.rtmpToHttpFlv(stream.url) ?: stream.url
-            } else {
-                stream.url
-            }
-
             when (stream.type.lowercase()) {
                 "hls" -> {
                     HlsDownloader().download(
-                        playlistUrl = effectiveUrl,
+                        playlistUrl = stream.url,
                         outputFile  = outputFile,
                         onProgress  = { bytes, segs, total ->
                             callback.onProgress(
@@ -70,9 +63,25 @@ class DownloadManager(context: Context) {
                         onError = { error -> callback.onError(stream.id, error) }
                     )
                 }
+                "rtmp" -> {
+                    // Use the native RTMP TCP client so the stream is downloaded
+                    // directly via the RTMP protocol without any URL conversion.
+                    RtmpDownloader().download(
+                        rtmpUrl     = stream.url,
+                        outputFile  = outputFile,
+                        onProgress  = { bytes ->
+                            callback.onProgress(
+                                stream.id,
+                                DownloadState.Downloading(bytesDownloaded = bytes)
+                            )
+                        },
+                        isCancelled = { !isActive },
+                        onError     = { error -> callback.onError(stream.id, error) }
+                    )
+                }
                 else -> {
                     DirectDownloader().download(
-                        streamUrl  = effectiveUrl,
+                        streamUrl  = stream.url,
                         outputFile = outputFile,
                         onProgress = { bytes, total ->
                             callback.onProgress(

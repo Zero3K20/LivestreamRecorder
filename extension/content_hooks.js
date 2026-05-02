@@ -45,7 +45,8 @@
             if (!/pull\.cdnsi\.com$/i.test(u.hostname)) return null;
             if (u.protocol !== 'https:') return null;
             const pathname = u.pathname.replace(/\.flv$/i, '');
-            return `rtmp://${u.host}${pathname}${u.search}`;
+            // Use u.hostname (without port) so the RTMP URL defaults to port 1935.
+            return `rtmp://${u.hostname}${pathname}${u.search}`;
         } catch { return null; }
     }
 
@@ -69,6 +70,10 @@
      */
     function send(url, mimeType) {
         if (!url || typeof url !== 'string') return;
+        // For pull.cdnsi.com HTTPS FLV URLs, substitute the RTMP URL so the
+        // recorder downloads via RTMPT (real RTMP protocol) and bypasses 403.
+        const rtmpSub = cdnsiToRtmp(url);
+        if (rtmpSub) { send(rtmpSub, mimeType); return; }
         // Once a .m3u8 playlist has been seen, suppress individual .ts segments.
         if (m3u8Detected && TS_URL_RE.test(url)) return;
         if (M3U8_URL_RE.test(url)) m3u8Detected = true;

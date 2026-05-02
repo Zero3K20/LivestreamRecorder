@@ -230,50 +230,44 @@ object PacketParser {
     }
 
     /**
-     * Attempt to extract the `tcUrl` field from an RTMP C0+C1+C2 handshake or
-     * connect command payload.
+     * Attempt to extract the `tcUrl` field from an RTMP connect command payload.
      *
-     * RTMP handshake: C0 (1 byte version = 0x03) + C1 (1536 bytes random) = 1537 bytes
-     * before any AMF0 data arrives.  Once the handshake completes, the client sends
-     * a `connect` AMF0 command whose first property is `tcUrl` (the stream URL).
+     * The RTMP `connect` command contains an AMF0 object whose `tcUrl` property
+     * carries the stream URL.  AMF0 object key format: 2-byte length (big-endian)
+     * + UTF-8 characters.  After the key comes AMF0 type byte 0x02 (String) and a
+     * 2-byte length prefix.
      *
-     * Parsing full AMF0 is complex; instead we scan the raw bytes for the ASCII
-     * string `"tcUrl"` followed by the AMF0 string type (0x02) and a 2-byte length,
-     * then read the value.  This heuristic is robust against padding variations.
-     *
-     * Falls back to building a bare `rtmp://host/` URL from [serverAddr] when no
-     * `tcUrl` is found (e.g. during the C0/C1 handshake phase).
+     * We scan the raw byte array directly (no String conversion) for the 5 ASCII
+     * bytes of "tcUrl" to avoid allocating a full copy of potentially large
+     * handshake packets.
      *
      * @param data       Raw TCP payload bytes.
-     * @param serverAddr 4-byte destination IP address.
+     * @param serverAddr 4-byte destination IP address (unused here, kept for API compat).
      * @return Extracted RTMP stream URL, or null if the data cannot be parsed.
      */
     fun extractRtmpUrl(data: ByteArray, serverAddr: ByteArray): String? {
         if (data.size < 2) return null
-        val text = try { String(data, Charsets.ISO_8859_1) } catch (_: Exception) { return null }
+        // "tcUrl" as ASCII bytes
+        val key = byteArrayOf('t'.code.toByte(), 'c'.code.toByte(), 'U'.code.toByte(), 'r'.code.toByte(), 'l'.code.toByte())
+        val keyLen = key.size
 
-        // Search for the "tcUrl" key in the AMF0 connect command.
-        // AMF0 key format: 2-byte length (big-endian) + UTF-8 characters.
-        // We search for the key name bytes directly for simplicity.
-        val tcUrlKey = "tcUrl"
-        var pos = text.indexOf(tcUrlKey)
-        while (pos >= 0) {
-            // After the key name comes: AMF0 type (1 byte), then for type=0x02 (String):
-            //   2-byte length + string bytes.
-            val valStart = pos + tcUrlKey.length
-            if (valStart + 3 < data.size && data[valStart] == 0x02.toByte()) {
-                val strLen = (u8(data, valStart + 1) shl 8) or u8(data, valStart + 2)
-                val strStart = valStart + 3
-                if (strLen > 0 && strStart + strLen <= data.size) {
-                    val candidate = try {
-                        String(data, strStart, strLen, Charsets.UTF_8)
-                    } catch (_: Exception) { null }
-                    if (candidate != null && candidate.startsWith("rtmp", ignoreCase = true)) {
-                        return candidate
-                    }
-                }
+        outer@ for (pos in 0 until data.size - keyLen - 3) {
+            // Quick first-byte check before full comparison
+            if (data[pos] != key[0]) continue
+            for (i in 1 until keyLen) {
+                if (data[pos + i] != key[i]) continue@outer
             }
-            pos = text.indexOf(tcUrlKey, pos + 1)
+            // Found "tcUrl" at `pos`; check for AMF0 String type (0x02) immediately after
+            val valStart = pos + keyLen
+            if (valStart + 3 > data.size) continue
+            if (data[valStart] != 0x02.toByte()) continue
+            val strLen   = (u8(data, valStart + 1) shl 8) or u8(data, valStart + 2)
+            val strStart = valStart + 3
+            if (strLen <= 0 || strStart + strLen > data.size) continue
+            val candidate = try {
+                String(data, strStart, strLen, Charsets.UTF_8)
+            } catch (_: Exception) { continue }
+            if (candidate.startsWith("rtmp", ignoreCase = true)) return candidate
         }
         return null
     }

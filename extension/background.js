@@ -106,7 +106,7 @@ async function startDL(url, mimeType) {
         /application\/(x-mpegurl|vnd\.apple\.mpegurl)/i.test(mimeType || '')
     );
 
-    // RTMP URLs are downloaded as HTTP-FLV (same host/path, http:// scheme, .flv extension).
+    // RTMP streams produce FLV output (RTMPT wraps the RTMP protocol in HTTP POST requests).
     let ext = isHLS ? 'ts' : isRTMP ? 'flv' : isWS ? 'bin' : 'mp4';
     if (isWS) {
         try {

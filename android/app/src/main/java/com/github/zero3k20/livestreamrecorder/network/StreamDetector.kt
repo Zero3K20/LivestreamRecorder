@@ -36,32 +36,4 @@ object StreamDetector {
             else                       -> null
         }
     }
-
-    /**
-     * Convert an RTMP/RTMPS URL to an HTTP-FLV URL suitable for download.
-     *
-     * CDNs (e.g. pull.cdnsi.com) serve the same stream over both RTMP and HTTP-FLV.
-     * Mapping: rtmp://host/live/STREAM[?q] → http://host/live/STREAM.flv[?q]
-     *          rtmps://host/live/STREAM[?q] → https://host/live/STREAM.flv[?q]
-     *
-     * @return HTTP-FLV URL, or null if [url] is not a valid RTMP URL.
-     */
-    fun rtmpToHttpFlv(url: String): String? {
-        val lower = url.lowercase()
-        val scheme = when {
-            lower.startsWith("rtmps://") -> "https"
-            lower.startsWith("rtmp://")  -> "http"
-            else                          -> return null
-        }
-        // Strip rtmp(s):// prefix
-        val rest = url.substringAfter("://")
-        // Append .flv if not already present
-        val withFlv = if (rest.contains(".flv", ignoreCase = true)) rest else {
-            // Insert before query string if present
-            val qIdx = rest.indexOf('?')
-            if (qIdx >= 0) rest.substring(0, qIdx) + ".flv" + rest.substring(qIdx)
-            else "$rest.flv"
-        }
-        return "$scheme://$withFlv"
-    }
 }

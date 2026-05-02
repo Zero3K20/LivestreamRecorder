@@ -1226,6 +1226,381 @@
         }
     }
 
+    // ─── RTMP / RTMPT downloader ───────────────────────────────────────────────────
+
+    /**
+     * Download a live stream from an rtmp:// or rtmps:// URL using RTMPT
+     * (RTMP Tunneled over HTTP — RFC-compatible transport that wraps the RTMP
+     * binary protocol in HTTP POST requests, the only RTMP-compatible transport
+     * available in a browser without native TCP socket access).
+     *
+     * RTMPT session flow:
+     *   POST /open/1              → session ID
+     *   POST /send/SID/N  (body=C0+C1)  → S0+S1+S2
+     *   POST /send/SID/N  (body=C2+connect+createStream+play)  → server responses
+     *   POST /idle/SID/N  repeatedly   → audio/video chunks  (written as FLV)
+     *
+     * Each RTMPT response body starts with a 1-byte polling-interval hint followed
+     * by raw RTMP bytes.  We ignore the interval and poll as fast as the stop signal
+     * allows.
+     *
+     * @param {string}                   rtmpUrl    rtmp[s]:// URL to download
+     * @param {FileSystemFileHandle}     fileHandle destination file
+     * @param {function(number): void}   onProgress bytes written so far
+     * @param {{ stopped: boolean }}     stopSignal
+     */
+    async function downloadRTMP(rtmpUrl, fileHandle, onProgress, stopSignal) {
+        const parsed = parseRtmpUrl(rtmpUrl);
+        if (!parsed) throw new Error('Invalid RTMP URL: ' + rtmpUrl);
+        const { scheme, host, port, app, streamName } = parsed;
+
+        // RTMPT uses HTTP/HTTPS on the standard web ports, not the RTMP port.
+        // rtmps → https:443, rtmp → http:80
+        const httpScheme = (scheme === 'rtmps') ? 'https' : 'http';
+        const httpPort   = (scheme === 'rtmps') ? 443 : 80;
+        const base       = `${httpScheme}://${host}:${httpPort}`;
+
+        // ── Binary helpers ──────────────────────────────────────────────────────
+        const concat = (...arrs) => {
+            const total = arrs.reduce((s, a) => s + a.length, 0);
+            const out   = new Uint8Array(total);
+            let   off   = 0;
+            for (const a of arrs) { out.set(a, off); off += a.length; }
+            return out;
+        };
+        const u8  = (n)       => new Uint8Array([n & 0xFF]);
+        const u16 = (n)       => new Uint8Array([(n >> 8) & 0xFF, n & 0xFF]);
+        const u24 = (n)       => new Uint8Array([(n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF]);
+        const u32BE = (n)     => {
+            const b = new Uint8Array(4);
+            const v = new DataView(b.buffer);
+            v.setUint32(0, n >>> 0, false);
+            return b;
+        };
+        const u32LE = (n)     => {
+            const b = new Uint8Array(4);
+            const v = new DataView(b.buffer);
+            v.setUint32(0, n >>> 0, true);
+            return b;
+        };
+        const f64BE = (n)     => {
+            const b = new Uint8Array(8);
+            new DataView(b.buffer).setFloat64(0, n, false);
+            return b;
+        };
+        const readU16BE = (buf, o) => ((buf[o] << 8) | buf[o + 1]) >>> 0;
+        const readU24BE = (buf, o) => ((buf[o] << 16) | (buf[o + 1] << 8) | buf[o + 2]) >>> 0;
+        const readU32BE = (buf, o) => (((buf[o] << 24) | (buf[o + 1] << 16) | (buf[o + 2] << 8) | buf[o + 3]) >>> 0);
+        const readU32LE = (buf, o) => ((buf[o] | (buf[o + 1] << 8) | (buf[o + 2] << 16) | (buf[o + 3] << 24)) >>> 0);
+
+        // ── AMF0 encoder ────────────────────────────────────────────────────────
+        const amfStr = (s) => {
+            const enc = new TextEncoder().encode(s);
+            return concat(new Uint8Array([0x02]), u16(enc.length), enc);
+        };
+        const amfNum  = (n) => concat(new Uint8Array([0x00]), f64BE(n));
+        const amfNull = ()  => new Uint8Array([0x05]);
+        const amfBool = (b) => new Uint8Array([0x01, b ? 1 : 0]);
+        const amfObj  = (props) => {
+            const parts = [new Uint8Array([0x03])];
+            for (const [k, v] of props) {
+                const kEnc = new TextEncoder().encode(k);
+                parts.push(u16(kEnc.length), kEnc);
+                if (typeof v === 'string')  parts.push(amfStr(v));
+                else if (typeof v === 'number')  parts.push(amfNum(v));
+                else if (typeof v === 'boolean') parts.push(amfBool(v));
+                else parts.push(amfNull());
+            }
+            // End-of-object marker: 0x00 0x00 0x09
+            parts.push(new Uint8Array([0x00, 0x00, 0x09]));
+            return concat(...parts);
+        };
+
+        // ── RTMP chunk encoder ──────────────────────────────────────────────────
+        const CHUNK_SIZE_OUT = 4096;
+        function encodeChunk(csid, typeId, streamId, timestamp, payload) {
+            const pieces = [];
+            let offset = 0;
+            while (offset < payload.length) {
+                const isFirst = offset === 0;
+                // Basic header: fmt=0 for first, fmt=3 (0xC0) for continuation
+                pieces.push(new Uint8Array([isFirst ? (csid & 0x3F) : (0xC0 | (csid & 0x3F))]));
+                if (isFirst) {
+                    const ts = Math.min(timestamp, 0xFFFFFE);
+                    pieces.push(u24(ts));                              // timestamp
+                    pieces.push(u24(payload.length));                  // message length
+                    pieces.push(u8(typeId));                           // message type
+                    pieces.push(u32LE(streamId));                      // stream ID (LE)
+                }
+                const end  = Math.min(offset + CHUNK_SIZE_OUT, payload.length);
+                pieces.push(payload.slice(offset, end));
+                offset = end;
+            }
+            return concat(...pieces);
+        }
+
+        // ── RTMP message builders ────────────────────────────────────────────────
+        const tcUrl = `rtmp://${host}:${port}/${app}`;
+        function buildSetChunkSize(size) {
+            const p = u32BE(size & 0x7FFFFFFF);
+            return encodeChunk(2, 1, 0, 0, p);
+        }
+        function buildConnect() {
+            const p = concat(
+                amfStr('connect'), amfNum(1), amfObj([
+                    ['app',           app],
+                    ['type',          'nonprivate'],
+                    ['flashVer',      'WIN 32,0,0,114'],
+                    ['swfUrl',        ''],
+                    ['tcUrl',         tcUrl],
+                    ['fpad',          false],
+                    ['capabilities',  15],
+                    ['audioCodecs',   3575],
+                    ['videoCodecs',   252],
+                    ['videoFunction', 1],
+                    ['pageUrl',       ''],
+                ])
+            );
+            return encodeChunk(3, 20, 0, 0, p);
+        }
+        function buildCreateStream() {
+            const p = concat(amfStr('createStream'), amfNum(2), amfNull());
+            return encodeChunk(3, 20, 0, 0, p);
+        }
+        function buildPlay(msid) {
+            const p = concat(amfStr('play'), amfNum(0), amfNull(), amfStr(streamName));
+            return encodeChunk(8, 20, msid, 0, p);
+        }
+
+        // ── RTMPT transport helpers ─────────────────────────────────────────────
+        // Use GM_xmlhttpRequest to bypass CORS and mixed-content restrictions.
+        const rtmptPost = (path, bodyBuf) => new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method:       'POST',
+                url:          base + path,
+                data:         bodyBuf ? bodyBuf.buffer : null,
+                headers:      {
+                    'Content-Type': 'application/x-fcs',
+                    'User-Agent':   'Shockwave Flash',
+                },
+                responseType: 'arraybuffer',
+                onload(r) {
+                    if (r.status >= 200 && r.status < 300) {
+                        resolve(new Uint8Array(r.response || new ArrayBuffer(0)));
+                    } else {
+                        reject(new Error(`RTMPT ${path}: HTTP ${r.status}`));
+                    }
+                },
+                onerror(e)   { reject(new Error('RTMPT network error: ' + (e.error || path))); },
+                ontimeout()  { reject(new Error('RTMPT timeout: ' + path)); },
+                timeout:     15000,
+            });
+        });
+
+        // ── RTMP chunk parser (incoming) ────────────────────────────────────────
+        const inChunkStates = {};  // per csid: { timestamp, msgLength, msgTypeId, msgStreamId }
+        const inMsgBufs     = {};  // per csid: { data: Uint8Array[], remaining: number }
+        let   inChunkSize   = 128;
+
+        /** Feed incoming RTMP bytes; calls onMsg(typeId, timestamp, streamId, payload) for each complete message. */
+        function parseChunks(bytes, onMsg) {
+            let pos = 0;
+            while (pos < bytes.length) {
+                const b0   = bytes[pos++];
+                const fmt  = (b0 >> 6) & 0x3;
+                let   csid = b0 & 0x3F;
+                if (csid === 0) { if (pos >= bytes.length) break; csid = bytes[pos++] + 64; }
+                else if (csid === 1) {
+                    if (pos + 1 >= bytes.length) break;
+                    csid = bytes[pos + 1] * 256 + bytes[pos] + 64; pos += 2;
+                }
+
+                const st = inChunkStates[csid] || (inChunkStates[csid] = { timestamp: 0, msgLength: 0, msgTypeId: 0, msgStreamId: 0 });
+
+                if (fmt === 0) {
+                    if (pos + 11 > bytes.length) break;
+                    let ts = readU24BE(bytes, pos); pos += 3;
+                    st.msgLength   = readU24BE(bytes, pos); pos += 3;
+                    st.msgTypeId   = bytes[pos++];
+                    st.msgStreamId = readU32LE(bytes, pos); pos += 4;
+                    if (ts === 0xFFFFFF) { if (pos + 4 > bytes.length) break; ts = readU32BE(bytes, pos); pos += 4; }
+                    st.timestamp = ts;
+                } else if (fmt === 1) {
+                    if (pos + 7 > bytes.length) break;
+                    let delta = readU24BE(bytes, pos); pos += 3;
+                    st.msgLength  = readU24BE(bytes, pos); pos += 3;
+                    st.msgTypeId  = bytes[pos++];
+                    if (delta === 0xFFFFFF) { if (pos + 4 > bytes.length) break; delta = readU32BE(bytes, pos); pos += 4; }
+                    st.timestamp += delta;
+                } else if (fmt === 2) {
+                    if (pos + 3 > bytes.length) break;
+                    let delta = readU24BE(bytes, pos); pos += 3;
+                    if (delta === 0xFFFFFF) { if (pos + 4 > bytes.length) break; delta = readU32BE(bytes, pos); pos += 4; }
+                    st.timestamp += delta;
+                }
+                // fmt === 3: no header
+
+                const buf = inMsgBufs[csid] || (inMsgBufs[csid] = { data: [], remaining: st.msgLength });
+                if (fmt === 0 || fmt === 1) { buf.data = []; buf.remaining = st.msgLength; }
+
+                const toRead = Math.min(inChunkSize, buf.remaining);
+                if (pos + toRead > bytes.length) break;
+                buf.data.push(bytes.slice(pos, pos + toRead));
+                buf.remaining -= toRead;
+                pos += toRead;
+
+                if (buf.remaining === 0 && buf.data.length > 0) {
+                    const payload = concat(...buf.data);
+                    buf.data = []; buf.remaining = 0;
+                    onMsg(st.msgTypeId, st.timestamp, st.msgStreamId, payload);
+                }
+            }
+        }
+
+        // ── FLV helpers ─────────────────────────────────────────────────────────
+        const flvHeader = concat(
+            new Uint8Array([0x46, 0x4C, 0x56, 0x01, 0x05, 0x00, 0x00, 0x00, 0x09]),
+            u32BE(0), // previous tag size 0
+        );
+        function flvTag(tagType, ts, data) {
+            const size = 11 + data.length;
+            return concat(
+                u8(tagType),
+                u24(data.length),
+                u24(ts & 0xFFFFFF),
+                u8((ts >> 24) & 0xFF),
+                new Uint8Array([0, 0, 0]),      // stream ID
+                data,
+                u32BE(size),                    // previous tag size
+            );
+        }
+
+        // ── State machine ────────────────────────────────────────────────────────
+        const writer = await _makeFlushingWriter(fileHandle);
+        try {
+            // 1. Open RTMPT session
+            let sessionId;
+            {
+                const resp = await rtmptPost('/open/1', null);
+                // Response: "SESSION_ID\r\n" — decode text
+                sessionId = new TextDecoder().decode(resp).trim();
+                if (!sessionId) throw new Error('RTMPT: empty session ID from /open/1');
+                dbg('RTMPT session:', sessionId);
+            }
+
+            let seqNum = 0;
+            let accumBuf = new Uint8Array(0); // accumulates incoming RTMP bytes across polls
+
+            // Process one RTMPT response body: skip 1-byte interval, append rest
+            function absorbResponse(raw) {
+                if (raw.length <= 1) return; // just the interval byte, no data
+                const rtmpBytes = raw.slice(1);
+                accumBuf = concat(accumBuf, rtmpBytes);
+            }
+
+            // 2. C0 + C1 handshake
+            const c1 = new Uint8Array(1536);
+            new DataView(c1.buffer).setUint32(0, (Date.now() / 1000) | 0, false);
+            crypto.getRandomValues(c1.subarray(8));
+            const c0c1 = concat(new Uint8Array([3]), c1);
+            absorbResponse(await rtmptPost(`/send/${sessionId}/${++seqNum}`, c0c1));
+
+            // 3. Poll until we have full S0+S1+S2 (3073 bytes)
+            while (accumBuf.length < 3073 && !stopSignal.stopped) {
+                absorbResponse(await rtmptPost(`/idle/${sessionId}/${++seqNum}`, new Uint8Array(0)));
+            }
+            if (stopSignal.stopped) return;
+
+            // S1 is bytes 1..1536 of the server reply
+            const s1  = accumBuf.slice(1, 1537);
+            accumBuf  = accumBuf.slice(3073);
+
+            // 4. Send C2 + Set Chunk Size + connect
+            const c2    = s1;
+            const toSend = concat(c2, buildSetChunkSize(CHUNK_SIZE_OUT), buildConnect());
+            absorbResponse(await rtmptPost(`/send/${sessionId}/${++seqNum}`, toSend));
+
+            // 5. State-machine: process server messages and issue createStream / play
+            let rtmpState  = 'connecting'; // → 'creating' → 'playing' → 'streaming'
+            let msid       = 0;
+            let bytesOut   = 0;
+
+            // Write FLV header
+            await writer.write(flvHeader.buffer);
+            bytesOut += flvHeader.length;
+            onProgress(bytesOut);
+
+            let _pendingRtmptSend = null;
+            // Collect FLV tags produced by the sync parseChunks pass, then write them
+            // asynchronously in the outer loop so writes are always properly awaited.
+            const _pendingTags = [];
+
+            const handleMsg = (typeId, ts, sid, payload) => {
+                switch (typeId) {
+                    case 1: // Set Chunk Size
+                        if (payload.length >= 4) inChunkSize = readU32BE(payload, 0) & 0x7FFFFFFF;
+                        break;
+                    case 20: { // AMF0 command
+                        if (payload[0] !== 0x02) break;
+                        const nameLen = readU16BE(payload, 1);
+                        const name    = new TextDecoder().decode(payload.slice(3, 3 + nameLen));
+                        if (name === '_result') {
+                            if (rtmpState === 'connecting') {
+                                rtmpState = 'creating';
+                                dbg('RTMPT: connected, sending createStream');
+                                _pendingRtmptSend = buildCreateStream();
+                            } else if (rtmpState === 'creating') {
+                                let p = 3 + nameLen + 9; // skip name + txid number (1+8)
+                                while (p < payload.length && payload[p] === 0x05) p++;
+                                if (payload[p] === 0x00 && p + 9 <= payload.length) {
+                                    msid = Math.round(new DataView(payload.buffer, payload.byteOffset + p + 1, 8).getFloat64(0, false));
+                                }
+                                rtmpState = 'playing';
+                                dbg('RTMPT: createStream OK, msid=%d, sending play', msid);
+                                _pendingRtmptSend = buildPlay(msid);
+                            }
+                        } else if (name === 'onStatus' && rtmpState === 'playing') {
+                            rtmpState = 'streaming';
+                            dbg('RTMPT: streaming started');
+                        }
+                        break;
+                    }
+                    case 8:  if (rtmpState === 'streaming') _pendingTags.push(flvTag(0x08, ts, payload)); break;
+                    case 9:  if (rtmpState === 'streaming') _pendingTags.push(flvTag(0x09, ts, payload)); break;
+                    case 18: if (rtmpState === 'streaming') _pendingTags.push(flvTag(0x12, ts, payload)); break;
+                }
+            };
+
+            // Main poll loop
+            while (!stopSignal.stopped) {
+                // Process any buffered RTMP bytes synchronously (collects into _pendingTags)
+                parseChunks(accumBuf, handleMsg);
+                accumBuf = new Uint8Array(0);
+
+                // Flush any FLV tags that were collected above
+                for (const tag of _pendingTags) {
+                    await writer.write(tag.buffer);
+                    bytesOut += tag.length;
+                    onProgress(bytesOut);
+                }
+                _pendingTags.length = 0;
+
+                const toSend2 = _pendingRtmptSend || new Uint8Array(0);
+                _pendingRtmptSend = null;
+
+                let raw;
+                if (toSend2.length > 0) {
+                    raw = await rtmptPost(`/send/${sessionId}/${++seqNum}`, toSend2);
+                } else {
+                    raw = await rtmptPost(`/idle/${sessionId}/${++seqNum}`, new Uint8Array(0));
+                }
+                absorbResponse(raw);
+            }
+        } finally {
+            await writer.close();
+        }
+    }
+
     // ─── Start / stop downloads ───────────────────────────────────────────────────
 
     /** Creates the standard progress callback used by both startDownload and resumeDownload. */
@@ -1267,7 +1642,7 @@
         const isRTMP   = isRTMPStreamURL(url);
         const isHLS    = !isWS && !isWebRTC && !isRTMP && (/\.m3u8(\?|$)/i.test(url) || /[?&].*m3u8/i.test(url) ||
                           /application\/(x-mpegurl|vnd\.apple\.mpegurl)/i.test(mime));
-        // RTMP URLs are downloaded as HTTP-FLV; use .flv extension.
+        // RTMP streams are downloaded via RTMPT and produce an FLV file; use .flv extension.
         let ext = isHLS ? 'ts' : isWebRTC ? 'webm' : isRTMP ? 'flv' : 'mp4';
         if (isWS) {
             try {
@@ -1324,13 +1699,10 @@
             } else if (isWebRTC) {
                 await downloadMediaRecorder(url, fileHandle, onProgress, stopSignal);
             } else if (isRTMP) {
-                // Browsers cannot connect to RTMP directly.  Convert the RTMP URL to
-                // its HTTP-FLV equivalent (same host/path, http:// scheme, .flv extension)
-                // and download as a direct HTTP stream.
-                const httpFlvUrl = convertRtmpToHttpFlv(url);
-                if (!httpFlvUrl) throw new Error('Could not convert RTMP URL to HTTP-FLV: ' + url);
-                dbg('RTMP: converted %s → %s', url, httpFlvUrl);
-                await downloadDirect(httpFlvUrl, fileHandle, onProgress, stopSignal);
+                // Download via RTMPT (RTMP Tunneled over HTTP), the standard browser-
+                // compatible RTMP transport.  This connects using real RTMP protocol
+                // without any URL conversion, bypassing HTTPS 403 restrictions.
+                await downloadRTMP(url, fileHandle, onProgress, stopSignal);
             } else {
                 await downloadDirect(url, fileHandle, onProgress, stopSignal);
             }
@@ -1382,31 +1754,30 @@
     }
 
     /**
-     * Convert an RTMP/RTMPS URL to an equivalent HTTP-FLV URL for download.
-     *
-     * RTMP CDNs (e.g. pull.cdnsi.com) typically serve the same stream over
-     * both RTMP and HTTP-FLV.  The mapping is:
-     *   rtmp://host/live/STREAM_ID[?q]  →  http://host/live/STREAM_ID.flv[?q]
-     *   rtmps://host/live/STREAM_ID[?q] → https://host/live/STREAM_ID.flv[?q]
-     *
-     * @param {string} rtmpUrl
-     * @returns {string|null} HTTP-FLV URL, or null if the input is not a valid RTMP URL.
+     * Parse an rtmp[s]:// URL into its components.
+     * Fragment identifiers are stripped since RTMP has no concept of fragments.
+     * @param {string} url
+     * @returns {{ scheme: string, host: string, port: number, app: string, streamName: string }|null}
      */
-    function convertRtmpToHttpFlv(rtmpUrl) {
+    function parseRtmpUrl(url) {
         try {
-            const u = new URL(rtmpUrl);
-            if (!/^rtmps?:$/i.test(u.protocol)) return null;
-            const scheme   = u.protocol === 'rtmps:' ? 'https' : 'http';
-            // Append .flv if not already present so the CDN serves the FLV container.
-            const pathname = /\.flv$/i.test(u.pathname) ? u.pathname : u.pathname + '.flv';
-            return `${scheme}://${u.host}${pathname}${u.search}`;
+            // Strip any fragment before parsing
+            const clean = url.split('#')[0];
+            const m = /^(rtmps?):\/\/([^/:]+)(?::(\d+))?\/(([^/?#]+)\/?([^?#]*)?)/.exec(clean);
+            if (!m) return null;
+            const scheme     = m[1].toLowerCase();
+            const host       = m[2];
+            const port       = m[3] ? parseInt(m[3], 10) : (scheme === 'rtmps' ? 443 : 1935);
+            const app        = m[5] || 'live';
+            const streamName = m[6] || '';
+            return { scheme, host, port, app, streamName };
         } catch { return null; }
     }
 
     /**
      * Convert an HTTPS FLV URL from pull.cdnsi.com to its RTMP equivalent.
-     * This lets the recorder use the HTTP-FLV endpoint (derived from the RTMP URL)
-     * instead of the original HTTPS endpoint, which may be more reliably accessible.
+     * This lets the recorder use the RTMP protocol (via RTMPT) instead of
+     * the HTTPS endpoint, which may return 403 due to session/referrer checks.
      *
      * Mapping: https://pull.cdnsi.com/live/STREAM.flv[?q]
      *        → rtmp://pull.cdnsi.com/live/STREAM[?q]
@@ -1421,7 +1792,8 @@
             if (u.protocol !== 'https:') return null;
             // Strip .flv extension; RTMP URLs use the bare stream name.
             const pathname = u.pathname.replace(/\.flv$/i, '');
-            return `rtmp://${u.host}${pathname}${u.search}`;
+            // Use u.hostname (without port) so the RTMP URL defaults to port 1935.
+            return `rtmp://${u.hostname}${pathname}${u.search}`;
         } catch { return null; }
     }
 
@@ -1436,9 +1808,8 @@
         if (typeof url !== 'string' || !/^(https?|wss?|webrtc|rtmps?):/.test(url)) return;
 
         // For pull.cdnsi.com HTTPS FLV URLs, substitute the RTMP equivalent so the
-        // recorder uses the HTTP-FLV endpoint (converted from RTMP at download time)
-        // instead of the HTTPS endpoint.  This is more reliably accessible on CDNs
-        // that restrict HTTPS streaming to in-player sessions.
+        // recorder downloads via RTMPT (real RTMP protocol) instead of the HTTPS
+        // endpoint, which may return 403 due to session/referrer restrictions.
         const cdnsiRtmp = convertCdnsiToRtmp(url);
         if (cdnsiRtmp) {
             // Recurse with the RTMP URL; the original HTTPS URL is not added.
@@ -2463,10 +2834,8 @@ return p;
                 await downloadHLS(dl.url, fileHandle, onProgress, dl.stopSignal,
                     { keepExisting: true, seekOffset: startOffset });
             } else if (dl.isRTMP) {
-                const httpFlvUrl = convertRtmpToHttpFlv(dl.url);
-                if (!httpFlvUrl) throw new Error('Could not convert RTMP URL to HTTP-FLV: ' + dl.url);
-                await downloadDirect(httpFlvUrl, fileHandle, onProgress, dl.stopSignal,
-                    { startOffset });
+                // RTMP streams are live; resume from beginning on restart.
+                await downloadRTMP(dl.url, fileHandle, onProgress, dl.stopSignal);
             } else {
                 await downloadDirect(dl.url, fileHandle, onProgress, dl.stopSignal,
                     { startOffset });
