@@ -99,19 +99,21 @@ async function startDL(url, mimeType) {
 
     const id    = nextId++;
     const isWS  = /^wss?:\/\//i.test(url);
-    const isHLS = !isWS && (
+    const isRTMP = /^rtmps?:\/\//i.test(url);
+    const isHLS = !isWS && !isRTMP && (
         /\.m3u8(\?|$)/i.test(url) ||
         /[?&].*m3u8/i.test(url)   ||
         /application\/(x-mpegurl|vnd\.apple\.mpegurl)/i.test(mimeType || '')
     );
 
-    let ext = isHLS ? 'ts' : isWS ? 'bin' : 'mp4';
+    // RTMP streams produce FLV output (RTMPT wraps the RTMP protocol in HTTP POST requests).
+    let ext = isHLS ? 'ts' : isRTMP ? 'flv' : isWS ? 'bin' : 'mp4';
     if (isWS) {
         try {
             const raw = new URL(url).pathname.split('.').pop().split('?')[0].toLowerCase();
             if (/^[a-z0-9]{2,5}$/.test(raw)) ext = raw;
         } catch { /* use 'bin' */ }
-    } else if (!isHLS) {
+    } else if (!isHLS && !isRTMP) {
         if (/video\/x-flv/i.test(mimeType || '')) {
             ext = 'flv';
         } else {
@@ -123,7 +125,7 @@ async function startDL(url, mimeType) {
     }
 
     const filename = generateFilename(url, ext);
-    const dl       = { id, url, filename, isHLS, isWS, status: 'downloading', bytesWritten: 0 };
+    const dl       = { id, url, filename, isHLS, isWS, isRTMP, status: 'downloading', bytesWritten: 0 };
     const list     = await getDownloads();
     list.push(dl);
     await setDownloads(list);
@@ -137,7 +139,7 @@ async function startDL(url, mimeType) {
     let forwarded = false;
     for (let attempt = 0; attempt < MAX_OFFSCREEN_MESSAGE_RETRIES && !forwarded; attempt++) {
         try {
-            await chrome.runtime.sendMessage({ target: 'offscreen', type: 'startDownload', id, url, filename, isHLS, isWS });
+            await chrome.runtime.sendMessage({ target: 'offscreen', type: 'startDownload', id, url, filename, isHLS, isWS, isRTMP });
             forwarded = true;
         } catch {
             await new Promise((r) => setTimeout(r, OFFSCREEN_MESSAGE_RETRY_DELAY_MS));

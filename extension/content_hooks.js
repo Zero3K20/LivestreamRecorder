@@ -10,6 +10,7 @@
     const STREAM_MIME_RE = /video\/x-flv|video\/mp2t|application\/(x-mpegurl|vnd\.apple\.mpegurl)/i;
     const WS_STREAM_RE   = /\.(flv|ts|m4s|mp4|aac)(\?|$)/i;
     const STREAM_RE      = /\.(m3u8|flv|mpd|ts)(\?|$)/i;
+    const RTMP_RE        = /^rtmps?:\/\//i;
     const M3U8_URL_RE    = /\.m3u8(\?|#|$)/i;
     const TS_URL_RE      = /\.ts(\?|#|$)/i;
 
@@ -25,7 +26,28 @@
     }
 
     function isStreamURL(url) {
-        return typeof url === 'string' && STREAM_RE.test(url);
+        if (typeof url !== 'string') return false;
+        // rtmp:// / rtmps:// URLs are always treated as streams.
+        if (RTMP_RE.test(url)) return true;
+        return STREAM_RE.test(url);
+    }
+
+    /**
+     * For pull.cdnsi.com HTTPS FLV URLs, return the RTMP equivalent.
+     * This lets the recorder use the HTTP-FLV endpoint (derived from RTMP)
+     * instead of the HTTPS endpoint for better reliability.
+     * @param {string} url
+     * @returns {string|null} RTMP URL, or null if not applicable.
+     */
+    function cdnsiToRtmp(url) {
+        try {
+            const u = new URL(url);
+            if (!/pull\.cdnsi\.com$/i.test(u.hostname)) return null;
+            if (u.protocol !== 'https:') return null;
+            const pathname = u.pathname.replace(/\.flv$/i, '');
+            // Use u.hostname (without port) so the RTMP URL defaults to port 1935.
+            return `rtmp://${u.hostname}${pathname}${u.search}`;
+        } catch { return null; }
     }
 
     function isWSStreamURL(url) {
@@ -48,6 +70,10 @@
      */
     function send(url, mimeType) {
         if (!url || typeof url !== 'string') return;
+        // For pull.cdnsi.com HTTPS FLV URLs, substitute the RTMP URL so the
+        // recorder downloads via RTMPT (real RTMP protocol) and bypasses 403.
+        const rtmpSub = cdnsiToRtmp(url);
+        if (rtmpSub) { send(rtmpSub, mimeType); return; }
         // Once a .m3u8 playlist has been seen, suppress individual .ts segments.
         if (m3u8Detected && TS_URL_RE.test(url)) return;
         if (M3U8_URL_RE.test(url)) m3u8Detected = true;

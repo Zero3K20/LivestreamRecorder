@@ -9,10 +9,11 @@ object StreamDetector {
     private val TS_RE   = Regex("""\.ts(\?|#|$)""",                RegexOption.IGNORE_CASE)
     private val MPD_RE  = Regex("""\.mpd(\?|#|$)""",               RegexOption.IGNORE_CASE)
     private val LIVE_RE = Regex("""/(live|hls|dash|stream|play)/""", RegexOption.IGNORE_CASE)
+    private val RTMP_RE = Regex("""^rtmps?://""",                   RegexOption.IGNORE_CASE)
 
     /**
      * Returns the stream type string ("hls", "flv", "mp4", "ts", "dash",
-     * "direct"), or null if the URL / MIME-type is not a recognised stream.
+     * "rtmp", "direct"), or null if the URL / MIME-type is not a recognised stream.
      */
     fun detectType(url: String, mimeType: String? = null): String? {
         if (mimeType != null) {
@@ -25,6 +26,7 @@ object StreamDetector {
         }
         val u = url.lowercase()
         return when {
+            RTMP_RE.containsMatchIn(u) -> "rtmp"
             HLS_RE.containsMatchIn(u)  -> "hls"
             FLV_RE.containsMatchIn(u)  -> "flv"
             MP4_RE.containsMatchIn(u)  -> "mp4"

@@ -63,6 +63,22 @@ class DownloadManager(context: Context) {
                         onError = { error -> callback.onError(stream.id, error) }
                     )
                 }
+                "rtmp" -> {
+                    // Use the native RTMP TCP client so the stream is downloaded
+                    // directly via the RTMP protocol without any URL conversion.
+                    RtmpDownloader().download(
+                        rtmpUrl     = stream.url,
+                        outputFile  = outputFile,
+                        onProgress  = { bytes ->
+                            callback.onProgress(
+                                stream.id,
+                                DownloadState.Downloading(bytesDownloaded = bytes)
+                            )
+                        },
+                        isCancelled = { !isActive },
+                        onError     = { error -> callback.onError(stream.id, error) }
+                    )
+                }
                 else -> {
                     DirectDownloader().download(
                         streamUrl  = stream.url,
@@ -112,7 +128,7 @@ class DownloadManager(context: Context) {
         val timestamp = System.currentTimeMillis()
         val ext = when (stream.type.lowercase()) {
             "hls"       -> "ts"
-            "flv"       -> "flv"
+            "flv", "rtmp" -> "flv"
             "mp4"       -> "mp4"
             "webm"      -> "webm"
             "websocket" -> "ts"

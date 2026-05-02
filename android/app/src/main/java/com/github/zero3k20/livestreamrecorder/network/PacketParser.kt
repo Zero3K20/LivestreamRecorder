@@ -169,7 +169,7 @@ object PacketParser {
         return buf
     }
 
-    // ── HTTP / TLS stream detection ───────────────────────────────────────────
+    // ── HTTP / TLS / RTMP stream detection ───────────────────────────────────────
 
     /**
      * Returns (url, type) if [data] looks like the start of an HTTP request
@@ -225,6 +225,49 @@ object PacketParser {
                 return null
             }
             pos += extLen
+        }
+        return null
+    }
+
+    /**
+     * Attempt to extract the `tcUrl` field from an RTMP connect command payload.
+     *
+     * The RTMP `connect` command contains an AMF0 object whose `tcUrl` property
+     * carries the stream URL.  AMF0 object key format: 2-byte length (big-endian)
+     * + UTF-8 characters.  After the key comes AMF0 type byte 0x02 (String) and a
+     * 2-byte length prefix.
+     *
+     * We scan the raw byte array directly (no String conversion) for the 5 ASCII
+     * bytes of "tcUrl" to avoid allocating a full copy of potentially large
+     * handshake packets.
+     *
+     * @param data       Raw TCP payload bytes.
+     * @param serverAddr 4-byte destination IP address (unused here, kept for API compat).
+     * @return Extracted RTMP stream URL, or null if the data cannot be parsed.
+     */
+    fun extractRtmpUrl(data: ByteArray, serverAddr: ByteArray): String? {
+        if (data.size < 2) return null
+        // "tcUrl" as ASCII bytes
+        val key = byteArrayOf('t'.code.toByte(), 'c'.code.toByte(), 'U'.code.toByte(), 'r'.code.toByte(), 'l'.code.toByte())
+        val keyLen = key.size
+
+        outer@ for (pos in 0 until data.size - keyLen - 3) {
+            // Quick first-byte check before full comparison
+            if (data[pos] != key[0]) continue
+            for (i in 1 until keyLen) {
+                if (data[pos + i] != key[i]) continue@outer
+            }
+            // Found "tcUrl" at `pos`; check for AMF0 String type (0x02) immediately after
+            val valStart = pos + keyLen
+            if (valStart + 3 > data.size) continue
+            if (data[valStart] != 0x02.toByte()) continue
+            val strLen   = (u8(data, valStart + 1) shl 8) or u8(data, valStart + 2)
+            val strStart = valStart + 3
+            if (strLen <= 0 || strStart + strLen > data.size) continue
+            val candidate = try {
+                String(data, strStart, strLen, Charsets.UTF_8)
+            } catch (_: Exception) { continue }
+            if (candidate.startsWith("rtmp", ignoreCase = true)) return candidate
         }
         return null
     }

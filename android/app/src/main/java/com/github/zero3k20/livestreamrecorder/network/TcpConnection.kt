@@ -145,6 +145,18 @@ class TcpConnection(
                     onStreamDetected("https://$sni/", "sni")
                 }
             }
+            // Port 1935 is the standard RTMP port.  Construct a candidate RTMP URL
+            // from the destination address; PacketParser parses the RTMP handshake
+            // to extract the tcUrl (app + stream path) if available, falling back
+            // to a bare host URL so the stream is at least visible in the UI.
+            if (serverPort == 1935) {
+                val rtmpUrl = PacketParser.extractRtmpUrl(payload, serverAddr)
+                    ?: run {
+                        val host = serverAddr.joinToString(".") { (it.toInt() and 0xFF).toString() }
+                        "rtmp://$host/"
+                    }
+                onStreamDetected(rtmpUrl, "rtmp")
+            }
         }
 
         // ACK the data.

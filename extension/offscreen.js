@@ -101,12 +101,332 @@ async function getWritable(filename) {
     return { writable: await opfsGetWritable(filename), savedToDir: false };
 }
 
-// ─── Background notification ──────────────────────────────────────────────────
+/**
+ * Parse an rtmp[s]:// URL into its components.
+ * Fragment identifiers are stripped since RTMP has no concept of fragments.
+ * @param {string} url
+ * @returns {{ scheme: string, host: string, port: number, app: string, streamName: string }|null}
+ */
+function parseRtmpUrl(url) {
+    try {
+        // Strip any fragment before parsing
+        const clean = url.split('#')[0];
+        const m = /^(rtmps?):\/\/([^/:]+)(?::(\d+))?\/(([^/?#]+)\/?([^?#]*)?)/.exec(clean);
+        if (!m) return null;
+        const scheme     = m[1].toLowerCase();
+        const host       = m[2];
+        const port       = m[3] ? parseInt(m[3], 10) : (scheme === 'rtmps' ? 443 : 1935);
+        const app        = m[5] || 'live';
+        const streamName = m[6] || '';
+        return { scheme, host, port, app, streamName };
+    } catch { return null; }
+}
 
 /** Fire-and-forget message to the background service worker. */
 function notifyBg(msg) {
     chrome.runtime.sendMessage({ target: 'background', ...msg }).catch(() => {});
 }
+
+/**
+ * Derive an HTTP-FLV URL from a parsed RTMP URL.
+ * rtmp://host/app/stream → http://host/app/stream.flv
+ * rtmps://host/app/stream → https://host/app/stream.flv
+ * @param {{ scheme: string, host: string, app: string, streamName: string }} p
+ * @returns {string}
+ */
+function _rtmpToHttpFlv(p) {
+    const httpScheme = p.scheme === 'rtmps' ? 'https' : 'http';
+    const path = p.streamName ? `/${p.app}/${p.streamName}.flv` : `/${p.app}.flv`;
+    return `${httpScheme}://${p.host}${path}`;
+}
+
+// ─── RTMP / RTMPT downloader ──────────────────────────────────────────────────
+
+/**
+ * Download an RTMP live stream.
+ *
+ * Strategy:
+ *   1. Probe the RTMPT endpoint (POST /open/1) to check whether the server
+ *      supports RTMPT (RTMP Tunneled over HTTP).  This check happens before any
+ *      data is written to the file, so we can still change course cleanly.
+ *   2a. If the probe returns a valid session ID → run the full RTMPT protocol.
+ *       RTMPT uses the same RTMP binary framing over HTTP POST requests and is
+ *       the only browser-native way to speak RTMP.
+ *   2b. If the probe fails (server doesn't support RTMPT, empty body, HTTP error)
+ *       → fall back to HTTP-FLV: a standard HTTP GET that streams raw FLV data.
+ *       The HTTP-FLV endpoint (http://host/app/stream.flv) is a separate access
+ *       method from the original HTTPS endpoint that may have returned 403, so
+ *       this fallback has a genuine chance of succeeding.
+ *
+ * @param {string}                          url        rtmp[s]:// URL
+ * @param {number}                          id         download ID (for notifyBg)
+ * @param {{ stopped: boolean }}            stopSignal
+ * @param {FileSystemWritableFileStream}    writable
+ */
+async function dlRTMP(url, id, stopSignal, writable) {
+    const parsed = parseRtmpUrl(url);
+    if (!parsed) throw new Error('Invalid RTMP URL: ' + url);
+    const { scheme, host, port, app, streamName } = parsed;
+
+    // RTMPT uses HTTP/HTTPS on the standard web ports, not the RTMP port.
+    // rtmps → https:443, rtmp → http:80
+    const httpScheme = (scheme === 'rtmps') ? 'https' : 'http';
+    const httpPort   = (scheme === 'rtmps') ? 443 : 80;
+    const base       = `${httpScheme}://${host}:${httpPort}`;
+
+    // ── Step 1: Probe RTMPT — must happen BEFORE writing anything to the file ──
+    let sessionId = null;
+    try {
+        const r = await fetch(`${base}/open/1`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/x-fcs', 'User-Agent': 'Shockwave Flash' },
+        });
+        if (r.ok) {
+            const raw = new TextDecoder().decode(new Uint8Array(await r.arrayBuffer())).trim();
+            // A valid RTMPT session ID is a short alphanumeric string, never HTML.
+            const MAX_SESSION_ID_LENGTH = 128;
+            if (raw && !raw.startsWith('<') && raw.length < MAX_SESSION_ID_LENGTH) sessionId = raw;
+        }
+    } catch { /* probe failed — network error or connection refused */ }
+
+    // ── Step 2b: HTTP-FLV fallback ──────────────────────────────────────────────
+    if (!sessionId) {
+        console.warn('[LSR] RTMPT not supported by server, falling back to HTTP-FLV');
+        const httpFlvUrl = _rtmpToHttpFlv(parsed);
+        // dlDirect owns the writable and closes it in its own finally block.
+        await dlDirect(httpFlvUrl, id, stopSignal, writable);
+        return;
+    }
+
+    // ── Step 2a: Full RTMPT protocol ────────────────────────────────────────────
+    console.debug('[LSR] RTMPT session:', sessionId);
+
+    // ── Binary helpers ──────────────────────────────────────────────────────────
+    const concat = (...arrs) => {
+        const total = arrs.reduce((s, a) => s + a.length, 0);
+        const out   = new Uint8Array(total);
+        let   off   = 0;
+        for (const a of arrs) { out.set(a, off); off += a.length; }
+        return out;
+    };
+    const u8      = (n) => new Uint8Array([n & 0xFF]);
+    const u16     = (n) => new Uint8Array([(n >> 8) & 0xFF, n & 0xFF]);
+    const u24     = (n) => new Uint8Array([(n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF]);
+    const u32BE   = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n >>> 0, false); return b; };
+    const u32LE   = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n >>> 0, true);  return b; };
+    const f64BE   = (n) => { const b = new Uint8Array(8); new DataView(b.buffer).setFloat64(0, n, false); return b; };
+    const rU16BE  = (b, o) => ((b[o] << 8) | b[o + 1]) >>> 0;
+    const rU24BE  = (b, o) => ((b[o] << 16) | (b[o + 1] << 8) | b[o + 2]) >>> 0;
+    const rU32BE  = (b, o) => (((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0);
+    const rU32LE  = (b, o) => ((b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0);
+
+    // ── AMF0 encoder ────────────────────────────────────────────────────────────
+    const amfStr  = (s) => { const e = new TextEncoder().encode(s); return concat(new Uint8Array([0x02]), u16(e.length), e); };
+    const amfNum  = (n) => concat(new Uint8Array([0x00]), f64BE(n));
+    const amfNull = ()  => new Uint8Array([0x05]);
+    const amfBool = (b) => new Uint8Array([0x01, b ? 1 : 0]);
+    const amfObj  = (props) => {
+        const parts = [new Uint8Array([0x03])];
+        for (const [k, v] of props) {
+            const ke = new TextEncoder().encode(k);
+            parts.push(u16(ke.length), ke);
+            if (typeof v === 'string')  parts.push(amfStr(v));
+            else if (typeof v === 'number')  parts.push(amfNum(v));
+            else if (typeof v === 'boolean') parts.push(amfBool(v));
+            else parts.push(amfNull());
+        }
+        parts.push(new Uint8Array([0x00, 0x00, 0x09])); // end-of-object
+        return concat(...parts);
+    };
+
+    // ── RTMP chunk encoder ───────────────────────────────────────────────────────
+    const CHUNK_OUT = 4096;
+    function encodeChunk(csid, typeId, streamId, ts, payload) {
+        const out = [];
+        let off = 0;
+        while (off < payload.length) {
+            const first = off === 0;
+            out.push(new Uint8Array([first ? (csid & 0x3F) : (0xC0 | (csid & 0x3F))]));
+            if (first) {
+                out.push(u24(Math.min(ts, 0xFFFFFE)), u24(payload.length), u8(typeId), u32LE(streamId));
+            }
+            const end = Math.min(off + CHUNK_OUT, payload.length);
+            out.push(payload.slice(off, end));
+            off = end;
+        }
+        return concat(...out);
+    }
+
+    const tcUrl = `rtmp://${host}:${port}/${app}`;
+    const buildSetChunkSize  = ()     => encodeChunk(2, 1, 0, 0, u32BE(CHUNK_OUT & 0x7FFFFFFF));
+    const buildConnect       = ()     => encodeChunk(3, 20, 0, 0, concat(amfStr('connect'), amfNum(1), amfObj([
+        ['app', app], ['type', 'nonprivate'], ['flashVer', 'WIN 32,0,0,114'],
+        ['swfUrl', ''], ['tcUrl', tcUrl], ['fpad', false],
+        ['capabilities', 15], ['audioCodecs', 3575], ['videoCodecs', 252],
+        ['videoFunction', 1], ['pageUrl', ''],
+    ])));
+    const buildCreateStream  = ()     => encodeChunk(3, 20, 0, 0, concat(amfStr('createStream'), amfNum(2), amfNull()));
+    const buildPlay          = (msid) => encodeChunk(8, 20, msid, 0, concat(amfStr('play'), amfNum(0), amfNull(), amfStr(streamName)));
+
+    // ── RTMPT transport ──────────────────────────────────────────────────────────
+    const rtmptPost = async (path, body) => {
+        const r = await fetch(base + path, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/x-fcs', 'User-Agent': 'Shockwave Flash' },
+            body:    body && body.length ? body : null,
+        });
+        if (!r.ok) throw new Error(`RTMPT ${path}: HTTP ${r.status}`);
+        return new Uint8Array(await r.arrayBuffer());
+    };
+
+    // ── RTMP chunk parser ────────────────────────────────────────────────────────
+    const stateMap  = {}; // csid → { timestamp, msgLength, msgTypeId, msgStreamId }
+    const bufMap    = {}; // csid → { data: Uint8Array[], remaining: number }
+    let   inChunkSz = 128;
+
+    function parseChunks(bytes, onMsg) {
+        let pos = 0;
+        while (pos < bytes.length) {
+            const b0  = bytes[pos++];
+            const fmt = (b0 >> 6) & 0x3;
+            let csid  = b0 & 0x3F;
+            if (csid === 0) { if (pos >= bytes.length) break; csid = bytes[pos++] + 64; }
+            else if (csid === 1) { if (pos + 1 >= bytes.length) break; csid = bytes[pos + 1] * 256 + bytes[pos] + 64; pos += 2; }
+
+            const st = stateMap[csid] || (stateMap[csid] = { timestamp: 0, msgLength: 0, msgTypeId: 0, msgStreamId: 0 });
+
+            if (fmt === 0) {
+                if (pos + 11 > bytes.length) break;
+                let ts = rU24BE(bytes, pos); pos += 3;
+                st.msgLength   = rU24BE(bytes, pos); pos += 3;
+                st.msgTypeId   = bytes[pos++];
+                st.msgStreamId = rU32LE(bytes, pos); pos += 4;
+                if (ts === 0xFFFFFF) { if (pos + 4 > bytes.length) break; ts = rU32BE(bytes, pos); pos += 4; }
+                st.timestamp = ts;
+            } else if (fmt === 1) {
+                if (pos + 7 > bytes.length) break;
+                let d = rU24BE(bytes, pos); pos += 3;
+                st.msgLength  = rU24BE(bytes, pos); pos += 3;
+                st.msgTypeId  = bytes[pos++];
+                if (d === 0xFFFFFF) { if (pos + 4 > bytes.length) break; d = rU32BE(bytes, pos); pos += 4; }
+                st.timestamp += d;
+            } else if (fmt === 2) {
+                if (pos + 3 > bytes.length) break;
+                let d = rU24BE(bytes, pos); pos += 3;
+                if (d === 0xFFFFFF) { if (pos + 4 > bytes.length) break; d = rU32BE(bytes, pos); pos += 4; }
+                st.timestamp += d;
+            }
+
+            const buf = bufMap[csid] || (bufMap[csid] = { data: [], remaining: st.msgLength });
+            if (fmt === 0 || fmt === 1) { buf.data = []; buf.remaining = st.msgLength; }
+
+            const toRead = Math.min(inChunkSz, buf.remaining);
+            if (pos + toRead > bytes.length) break;
+            buf.data.push(bytes.slice(pos, pos + toRead));
+            buf.remaining -= toRead;
+            pos += toRead;
+
+            if (buf.remaining === 0 && buf.data.length > 0) {
+                const payload = concat(...buf.data);
+                buf.data = []; buf.remaining = 0;
+                onMsg(st.msgTypeId, st.timestamp, payload);
+            }
+        }
+    }
+
+    // ── FLV helpers ──────────────────────────────────────────────────────────────
+    const flvHeader = concat(new Uint8Array([0x46, 0x4C, 0x56, 0x01, 0x05, 0x00, 0x00, 0x00, 0x09]), u32BE(0));
+    const flvTag = (type, ts, data) => {
+        const size = 11 + data.length;
+        return concat(u8(type), u24(data.length), u24(ts & 0xFFFFFF), u8((ts >> 24) & 0xFF),
+                      new Uint8Array([0, 0, 0]), data, u32BE(size));
+    };
+
+    // ── Session ──────────────────────────────────────────────────────────────────
+    // sessionId was already obtained from the probe above; proceed directly.
+    let bytesWritten = 0;
+    let seqNum = 0;
+    let accumBuf = new Uint8Array(0);
+
+    const absorb = (raw) => { if (raw.length > 1) accumBuf = concat(accumBuf, raw.slice(1)); };
+
+    // 2. Send C0+C1
+    const c1 = new Uint8Array(1536);
+    new DataView(c1.buffer).setUint32(0, (Date.now() / 1000) | 0, false);
+    crypto.getRandomValues(c1.subarray(8));
+    absorb(await rtmptPost(`/send/${sessionId}/${++seqNum}`, concat(new Uint8Array([3]), c1)));
+
+    // 3. Poll for S0+S1+S2
+    while (accumBuf.length < 3073 && !stopSignal.stopped) {
+        absorb(await rtmptPost(`/idle/${sessionId}/${++seqNum}`, new Uint8Array(0)));
+    }
+    if (stopSignal.stopped) { await writable.close(); return; }
+
+    const s1  = accumBuf.slice(1, 1537);
+    accumBuf  = accumBuf.slice(3073);
+
+    // 4. C2 + SetChunkSize + connect
+    absorb(await rtmptPost(`/send/${sessionId}/${++seqNum}`, concat(s1, buildSetChunkSize(), buildConnect())));
+
+    // 5. FLV header
+    await writable.write(flvHeader.buffer);
+    bytesWritten += flvHeader.length;
+    notifyBg({ type: 'patchDownload', id, patch: { bytesWritten } });
+
+    let rtmpState = 'connecting';
+    let msid      = 0;
+    let pendingSend = null;
+
+    const onMsg = async (typeId, ts, payload) => {
+        if (typeId === 1 && payload.length >= 4) { inChunkSz = rU32BE(payload, 0) & 0x7FFFFFFF; return; }
+        if (typeId === 20) { // AMF0 command
+            if (payload[0] !== 0x02) return;
+            const nameLen = rU16BE(payload, 1);
+            const name    = new TextDecoder().decode(payload.slice(3, 3 + nameLen));
+            if (name === '_result') {
+                if (rtmpState === 'connecting') { rtmpState = 'creating'; pendingSend = buildCreateStream(); }
+                else if (rtmpState === 'creating') {
+                    let p = 3 + nameLen + 9; // skip name, txid number
+                    while (p < payload.length && payload[p] === 0x05) p++;
+                    if (payload[p] === 0x00 && p + 9 <= payload.length) {
+                        msid = Math.round(new DataView(payload.buffer, payload.byteOffset + p + 1, 8).getFloat64(0, false));
+                    }
+                    rtmpState = 'playing'; pendingSend = buildPlay(msid);
+                }
+            } else if (name === 'onStatus' && rtmpState === 'playing') {
+                rtmpState = 'streaming';
+            }
+            return;
+        }
+        if (rtmpState !== 'streaming') return;
+        const tagType = typeId === 8 ? 0x08 : typeId === 9 ? 0x09 : typeId === 18 ? 0x12 : 0;
+        if (!tagType) return;
+        const tag = flvTag(tagType, ts, payload);
+        await writable.write(tag.buffer);
+        bytesWritten += tag.length;
+        notifyBg({ type: 'patchDownload', id, patch: { bytesWritten } });
+    };
+
+    // 6. Main poll loop
+    try {
+        while (!stopSignal.stopped) {
+            parseChunks(accumBuf, onMsg);
+            accumBuf = new Uint8Array(0);
+
+            const toSend = pendingSend || new Uint8Array(0);
+            pendingSend  = null;
+            absorb(toSend.length > 0
+                ? await rtmptPost(`/send/${sessionId}/${++seqNum}`, toSend)
+                : await rtmptPost(`/idle/${sessionId}/${++seqNum}`, new Uint8Array(0)));
+        }
+    } finally {
+        await writable.close();
+        // Best-effort close of RTMPT session
+        rtmptPost(`/close/${sessionId}/${++seqNum}`, new Uint8Array(0)).catch(() => {});
+    }
+}
+
+
 
 // ─── HLS downloader ───────────────────────────────────────────────────────────
 
@@ -234,7 +554,7 @@ async function dlWebSocket(url, id, stopSignal, writable) {
 
 // ─── Download entry point ─────────────────────────────────────────────────────
 
-async function handleStartDownload({ id, url, filename, isHLS, isWS }) {
+async function handleStartDownload({ id, url, filename, isHLS, isWS, isRTMP }) {
     const stopSignal = { stopped: false };
     activeOps.set(id, { stopSignal });
     let writable = null;
@@ -246,9 +566,14 @@ async function handleStartDownload({ id, url, filename, isHLS, isWS }) {
         const w = writable;
         writable = null; // downloader owns the writable and closes it in its finally block
 
-        if (isHLS)     await dlHLS(url, id, stopSignal, w);
-        else if (isWS) await dlWebSocket(url, id, stopSignal, w);
-        else           await dlDirect(url, id, stopSignal, w);
+        if (isHLS)       await dlHLS(url, id, stopSignal, w);
+        else if (isWS)   await dlWebSocket(url, id, stopSignal, w);
+        else if (isRTMP) {
+            // Try RTMPT first; if the server doesn't support it, dlRTMP falls
+            // back automatically to HTTP-FLV (same writable, nothing written yet).
+            await dlRTMP(url, id, stopSignal, w);
+        }
+        else             await dlDirect(url, id, stopSignal, w);
 
         notifyBg({ type: 'patchDownload', id, patch: { status: stopSignal.stopped ? 'stopped' : 'completed' } });
 
