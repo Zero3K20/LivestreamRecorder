@@ -659,8 +659,22 @@
         try {
             // Resolve master playlist to the best-quality media playlist URL.
             let mediaURL = url;
-            const initial = await gmFetch(url);
-            const initialParsed = parseM3U8(initial.responseText, url);
+
+            // Fetch the initial playlist via GM_xmlhttpRequest; fall back to the
+            // page's native fetch (which sends session cookies and browser-set
+            // headers) when GM returns 403 or a network error — some CDNs tie
+            // access to the browser session rather than purely to a URL token.
+            let initialText;
+            try {
+                const initial = await gmFetch(url);
+                initialText = initial.responseText;
+            } catch (e) {
+                if (!e.isGmForbidden && !e.isGmNetworkError) throw e;
+                dbg('HLS initial: gmFetch failed (%s), trying page fetch', e.message);
+                initialText = await _pageFetchText(url);
+            }
+
+            const initialParsed = parseM3U8(initialText, url);
             if (initialParsed.type === 'master') {
                 if (initialParsed.streams.length === 0) throw new Error('No streams found in master playlist');
                 mediaURL = initialParsed.streams[0].uri; // highest bandwidth
@@ -678,10 +692,27 @@
                     playlistText = r.responseText;
                     consecutiveErrors = 0;
                 } catch (e) {
-                    consecutiveErrors++;
-                    if (consecutiveErrors > 5) throw e;
-                    await sleep(targetDuration * 1000);
-                    continue;
+                    // GM_xmlhttpRequest may be missing session cookies or browser
+                    // headers that the CDN requires.  Try the page's native fetch
+                    // as a fallback before counting this as a consecutive error.
+                    if (e.isGmForbidden || e.isGmNetworkError) {
+                        try {
+                            dbg('HLS poll: gmFetch failed (%s), trying page fetch for %s', e.message, mediaURL);
+                            playlistText = await _pageFetchText(mediaURL);
+                            consecutiveErrors = 0;
+                        } catch (pageErr) {
+                            dbg('HLS poll: page fetch also failed: %s', pageErr.message);
+                            consecutiveErrors++;
+                            if (consecutiveErrors > 5) throw pageErr;
+                            await sleep(targetDuration * 1000);
+                            continue;
+                        }
+                    } else {
+                        consecutiveErrors++;
+                        if (consecutiveErrors > 5) throw e;
+                        await sleep(targetDuration * 1000);
+                        continue;
+                    }
                 }
 
                 const playlist = parseM3U8(playlistText, mediaURL);
@@ -809,6 +840,31 @@
             // already completed (or was intentionally stopped), so we suppress them.
             reader.cancel().catch(() => {});
         }
+    }
+
+    /**
+     * Fetch a URL via the page's native fetch API and return the response text.
+     *
+     * Used as a fallback when GM_xmlhttpRequest fails with 403 or a network error
+     * on HLS playlist URLs.  The page fetch runs in the browser's full session
+     * context and sends all cookies and request headers (Referer, Origin, etc.)
+     * that the page would normally send — headers that GM_xmlhttpRequest may omit,
+     * causing CDN/proxy servers to reject the request with 403.
+     *
+     * @param {string} url
+     * @returns {Promise<string>}
+     */
+    async function _pageFetchText(url) {
+        if (typeof _win.fetch !== 'function') throw new Error('Page fetch not available');
+        // Use the original (pre-hook) fetch so this request does not re-trigger
+        // LSR's stream-detection logic or activate any recording tap.
+        const response = await _fetch.call(_win, url);
+        if (!response.ok) {
+            const err = new Error(`HTTP ${response.status} for ${url}`);
+            if (response.status === 403) err.isPageForbidden = true;
+            throw err;
+        }
+        return response.text();
     }
 
     /**
